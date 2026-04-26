@@ -1,0 +1,44 @@
+[package]
+name = "devcontainer-config"
+version = "0.1.0"
+edition = "2021"
+description = "Process devcontainer.json files via the perry-bridge native binary."
+license = "MIT"
+repository = "https://github.com/wiki3-ai/devcontainers-cli"
+publish = false
+
+[features]
+default = ["embed"]
+# Embed the Perry-compiled binary into the crate via include_bytes!. Requires
+# the binary to be present under bin/devcontainer-config-<host-triple> at
+# `cargo build` time. Falls back to a clear runtime error if absent.
+embed = []
+# Sidecar mode: do not embed; the caller passes an explicit binary path.
+# Recommended for Tauri production builds (see ../../TAURI_INTEGRATION.md).
+sidecar = []
+# Internal: enable compilation of the fake Perry binary used by integration
+# tests. Not part of the public API.
+test-fakes = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "fs"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "fs", "test-util"] }
+
+[[bin]]
+name = "devcontainer-config-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "fake-perry"
+path = "tests/support/fake_perry.rs"
+required-features = ["test-fakes"]
+
+[lib]
+name = "devcontainer_config"
+path = "src/lib.rs"

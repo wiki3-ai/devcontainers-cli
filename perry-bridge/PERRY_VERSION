@@ -1,0 +1,8 @@
+# Pinned Perry CLI version used to compile perry-bridge/src/entry.ts.
+# Update only together with a fresh run of perry-bridge/spike/spike.ts and a
+# refresh of perry-bridge/api-audit.md.
+#
+# The build script (scripts/build-perry.sh) reads this file and either uses
+# the version exported in the local PATH or, if absent, instructs the user to
+# install it explicitly. We do not auto-install Perry from this repository.
+PERRY_VERSION=0.1.0

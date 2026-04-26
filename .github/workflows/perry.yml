@@ -1,0 +1,91 @@
+name: perry-bridge
+
+# Label-gated so we don't tax the main pipeline. To run this workflow on a
+# pull request, add the `perry` label.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'perry-bridge/**'
+      - 'example-usage/parse-config-rust/**'
+      - 'scripts/build-perry.sh'
+      - '.github/workflows/perry.yml'
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
+    paths:
+      - 'perry-bridge/**'
+      - 'example-usage/parse-config-rust/**'
+      - 'scripts/build-perry.sh'
+      - '.github/workflows/perry.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  rust-only:
+    # The Rust crate compiles without Perry; this job just verifies that
+    # invariant on every relevant change.
+    name: Rust crate (no Perry)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            perry-bridge/rust/devcontainer-config/target
+            example-usage/parse-config-rust/target
+          key: ${{ runner.os }}-cargo-perry-${{ hashFiles('perry-bridge/rust/**/Cargo.toml', 'example-usage/parse-config-rust/Cargo.toml') }}
+      - name: Build crate
+        working-directory: perry-bridge/rust/devcontainer-config
+        run: cargo build --all-targets
+      - name: Test crate (incl. fake-binary e2e)
+        working-directory: perry-bridge/rust/devcontainer-config
+        run: cargo test --features test-fakes
+      - name: Build example
+        working-directory: example-usage/parse-config-rust
+        run: cargo build
+      - name: Test example
+        working-directory: example-usage/parse-config-rust
+        run: cargo test
+
+  perry-build:
+    # Runs only when the PR has the `perry` label or when pushed to main.
+    # Compiles the Perry binary and runs the cargo example end-to-end.
+    name: Perry build + e2e (Linux)
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'perry')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20.x'
+      - name: Install dependencies
+        run: npm ci || yarn install --frozen-lockfile
+      - name: Install Perry
+        run: |
+          # Placeholder: install the pinned Perry CLI per upstream
+          # instructions. Left as a manual step until Perry publishes a
+          # canonical install method we can rely on in CI.
+          if ! command -v perry >/dev/null 2>&1; then
+            echo "perry not installed in this runner image; failing fast"
+            exit 1
+          fi
+          perry --version
+      - name: Build Perry binary
+        run: ./scripts/build-perry.sh x86_64-unknown-linux-gnu
+      - name: Run cargo example
+        working-directory: example-usage/parse-config-rust
+        run: cargo run --release | tee output.json
+      - name: Sanity-check output
+        working-directory: example-usage/parse-config-rust
+        run: |
+          # The workspace example config has a top-level "name" field.
+          jq -e '.config.name' output.json
