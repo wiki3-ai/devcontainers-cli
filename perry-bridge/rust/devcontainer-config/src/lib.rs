@@ -84,6 +84,15 @@ pub async fn load_devcontainer_config(workspace: &Path) -> Result<Value, BridgeE
 ///
 /// Use this from Tauri sidecar setups: pass `app.shell().sidecar(...)`'s
 /// resolved path here.
+///
+/// # Path encoding
+///
+/// `workspace` and `options.config_file` are forwarded to the child as JSON
+/// strings via [`std::path::Path::to_string_lossy`]. On Unix this is exact;
+/// on Windows, paths containing unpaired UTF-16 surrogates (extremely rare
+/// in practice for workspace folders the user picked from a file dialog)
+/// are lossily transcoded with U+FFFD. If your application can encounter
+/// such paths, validate with `Path::to_str().is_some()` before calling.
 pub async fn load_devcontainer_config_with_binary(
     bin_path: &Path,
     workspace: &Path,
