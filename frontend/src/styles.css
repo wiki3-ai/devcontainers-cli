@@ -61,6 +61,37 @@ ul.runtimes li::before {
 	color: #888;
 }
 
+.sidebar-section {
+	font-size: 0.7rem;
+	font-weight: 700;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: #888;
+	margin: 0.75rem 0.5rem 0.25rem;
+}
+
+.sidebar-empty {
+	margin: 0.25rem 0.5rem 0.5rem !important;
+	font-size: 0.8rem;
+	font-style: italic;
+}
+
+.state-running {
+	color: #4a4;
+}
+
+.state-stopped,
+.state-exited {
+	color: #c80;
+}
+
+.state-created {
+	color: #888;
+}
+
+.state-unknown {
+	color: #888;
+}
 ul.workspaces {
 	list-style: none;
 	margin: 0;

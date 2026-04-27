@@ -49,6 +49,14 @@ export interface LifecycleLogEvent {
 	ts: number;
 }
 
+/** A container as known to the runtime, irrespective of any workspace
+ *  link the dashboard maintains. */
+export interface ContainerEntry {
+	containerId: string;
+	state: 'created' | 'running' | 'stopped' | 'exited' | 'unknown';
+	imageRef?: string;
+}
+
 /**
  * Strongly typed wrappers around `invoke`. Kept as an object so tests can
  * monkey-patch individual methods, and so the FileHost adapter in
@@ -64,8 +72,15 @@ export const bridge = {
 	// --- runtime ------------------------------------------------------------
 	list_runtimes: () => invoke<RuntimeInfo[]>('list_runtimes'),
 	select_runtime: (id: RuntimeInfo['id']) => invoke<void>('select_runtime', { id }),
+	list_containers: () => invoke<ContainerEntry[]>('list_containers'),
+	container_start_by_id: (containerId: string) =>
+		invoke<void>('container_start_by_id', { containerId }),
+	container_stop_by_id: (containerId: string) =>
+		invoke<void>('container_stop_by_id', { containerId }),
+	container_remove_by_id: (containerId: string, force = true) =>
+		invoke<void>('container_remove_by_id', { containerId, force }),
 
-	// --- container lifecycle ------------------------------------------------
+	// --- container lifecycle (workspace-scoped) ----------------------------
 	container_status: (workspaceId: string) => invoke<ContainerStatus>('container_status', { workspaceId }),
 	container_up: (workspaceId: string) => invoke<ContainerStatus>('container_up', { workspaceId }),
 	container_stop: (workspaceId: string) => invoke<ContainerStatus>('container_stop', { workspaceId }),

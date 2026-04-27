@@ -226,6 +226,25 @@ impl ContainerRuntime for AppleContainersRuntime {
 
     async fn start(&self, container_id: &str) -> Result<(), ContainerRuntimeError> {
         run_capturing(&self.cli, ["start", container_id]).await?;
+        // Apple's `container start` returns as soon as the start request is
+        // accepted, but the runtime may still be transitioning the
+        // container into "running" state when we immediately try to
+        // `exec` the postCreateCommand. Poll inspect briefly so we
+        // don't race the lifecycle hook into "cannot exec: container is
+        // not running".
+        for attempt in 0u32..20 {
+            match self.inspect(container_id).await {
+                Ok(status) if matches!(status.state, ContainerState::Running) => return Ok(()),
+                Ok(_) | Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    debug!(container = container_id, attempt, "waiting for running state");
+                }
+            }
+        }
+        warn!(
+            container = container_id,
+            "container did not reach Running state within timeout; continuing anyway"
+        );
         Ok(())
     }
 
