@@ -4,8 +4,8 @@
 	"version": "0.1.0",
 	"identifier": "ai.wiki3.devcontainers",
 	"build": {
-		"beforeDevCommand": "yarn --cwd ../frontend dev",
-		"beforeBuildCommand": "deno task build && yarn --cwd ../frontend build",
+		"beforeDevCommand": "yarn --cwd frontend dev",
+		"beforeBuildCommand": "deno task build && yarn --cwd frontend build",
 		"devUrl": "http://localhost:1420",
 		"frontendDist": "../frontend/dist"
 	},
