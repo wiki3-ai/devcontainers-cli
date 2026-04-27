@@ -2,42 +2,83 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+// Devcontainer for working on Devcontainers.app (Tauri 2 + Deno).
+//
+// See `ROADMAP.md` for what lives where:
+//   - `src-tauri/`  Rust host (Tauri 2)
+//   - `spec/`       Deno-built devcontainer engine slice
+//   - `frontend/`   Vite TS WebView frontend
+//
+// The legacy Node CLI in `src/` is still present (slated for deletion in
+// step 9) but is NOT the focus of this devcontainer.
 {
-	"name": "Dev Containers CLI",
+	"name": "Devcontainers.app (Tauri 2 + Deno)",
 	"build": {
 		"dockerfile": "Dockerfile",
-		"args": { 
-			"VARIANT": "20-bookworm"
+		"args": {
+			"VARIANT": "bookworm"
 		}
 	},
+
+	"features": {
+		// Node + yarn for the Vite frontend and the spec-slice tsc check.
+		"ghcr.io/devcontainers/features/node:1": {
+			"version": "20",
+			"nodeGypDependencies": false
+		},
+		// Deno for `deno task check` / `build` (engine bundle).
+		"ghcr.io/devcontainers-extra/features/deno:1": {
+			"version": "latest"
+		},
+		// Useful for invoking the legacy CLI's container backends and for
+		// future Podman/Docker support (step 11).
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {},
+		"ghcr.io/devcontainers/features/github-cli:1": {}
+	},
+
 	"mounts": [
-		// Keep command history across instances
-		"source=dev-containers-cli-bashhistory,target=/home/node/commandhistory"
+		// Keep command history across instances.
+		"source=devcontainers-app-bashhistory,target=/home/vscode/commandhistory",
+		// Cache cargo registry/git and target dirs across rebuilds.
+		"source=devcontainers-app-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+		"source=devcontainers-app-cargo-git,target=/usr/local/cargo/git,type=volume",
+		"source=devcontainers-app-cargo-target,target=${containerWorkspaceFolder}/src-tauri/target,type=volume"
 	],
 
-	"postCreateCommand": "yarn install",
-
-	"remoteUser": "node",
-	
-	"features": {
-		"ghcr.io/devcontainers/features/docker-in-docker:2": {}
+	"containerEnv": {
+		"CARGO_TERM_COLOR": "always",
+		"RUST_BACKTRACE": "1"
 	},
-	
+
+	// Install JS deps for both the legacy spec typecheck (root yarn) and
+	// the Vite frontend, then warm up Deno's npm cache for the engine build.
+	"postCreateCommand": "sudo chown -R vscode:vscode /usr/local/cargo/registry /usr/local/cargo/git src-tauri/target && yarn install --frozen-lockfile && yarn --cwd frontend install --frozen-lockfile && deno task check || true",
+
+	"remoteUser": "vscode",
+
 	"customizations": {
 		"vscode": {
 			"extensions": [
+				"rust-lang.rust-analyzer",
+				"tamasfe.even-better-toml",
+				"vadimcn.vscode-lldb",
+				"denoland.vscode-deno",
 				"dbaeumer.vscode-eslint",
+				"esbenp.prettier-vscode",
 				"GitHub.vscode-pull-request-github"
-			]
-		},
-		"codespaces": {
-			"repositories": {
-				"devcontainers/features": {
-					"permissions": {
-						"contents": "write",
-						"workflows": "write"
-					}
-				}
+			],
+			"settings": {
+				"deno.enable": true,
+				"deno.enablePaths": [
+					"spec",
+					"scripts",
+					"frontend/src/devcontainer-engine"
+				],
+				"deno.config": "./deno.json",
+				"rust-analyzer.linkedProjects": [
+					"src-tauri/Cargo.toml"
+				],
+				"rust-analyzer.check.command": "clippy"
 			}
 		}
 	}
