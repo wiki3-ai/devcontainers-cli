@@ -148,9 +148,11 @@ fn exec_args_orders_options() {
     assert_eq!(a[0], "exec");
     assert!(a.contains(&"--tty".to_string()));
     let cid = a.iter().position(|s| s == "cid").unwrap();
-    assert_eq!(a[cid + 1], "--");
-    assert_eq!(a[cid + 2], "echo");
-    assert_eq!(a[cid + 3], "hi");
+    // Apple's `container exec` takes the process argv positionally with
+    // no `--` separator; the executable name follows the container id.
+    assert_eq!(a[cid + 1], "echo");
+    assert_eq!(a[cid + 2], "hi");
+    assert!(!a.iter().any(|s| s == "--"));
     // env order: A=1 must precede B=2
     let a1 = a.iter().position(|s| s == "A=1").unwrap();
     let b2 = a.iter().position(|s| s == "B=2").unwrap();
@@ -205,4 +207,28 @@ fn parse_list_empty_and_populated() {
     assert_eq!(v.len(), 2);
     assert_eq!(v[0].state, ContainerState::Running);
     assert_eq!(v[1].state, ContainerState::Exited);
+}
+
+#[test]
+fn parse_list_reads_nested_configuration_id_and_image() {
+    // Real shape emitted by `container list --all --format json` (Apple
+    // container CLI 0.x): top-level `status`, identity nested under
+    // `configuration`. Without nested-id support we'd return an empty
+    // container_id and any subsequent stop/remove would fail with
+    // "container with ID  not found".
+    let s = r#"[{
+        "status":"running",
+        "configuration":{
+            "id":"buildkit",
+            "image":{"reference":"ghcr.io/apple/container-builder-shim/builder:0.11.0"}
+        }
+    }]"#;
+    let v = parse_list(s).unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].container_id, "buildkit");
+    assert_eq!(v[0].state, ContainerState::Running);
+    assert_eq!(
+        v[0].image_ref.as_deref(),
+        Some("ghcr.io/apple/container-builder-shim/builder:0.11.0")
+    );
 }

@@ -738,7 +738,23 @@ impl LifecycleOrchestrator {
             LogStreamKind::Stderr,
             &format!("{op} failed: {detail}"),
         );
-        sink.status(workspace_id, "error", None, None, Some(&detail));
+        // Preserve any container linkage we've already recorded so the
+        // dashboard keeps showing the repo↔container relationship even
+        // when a hook (postCreateCommand, etc) fails after the container
+        // has been created or adopted.
+        let (cid, image) = {
+            let map = self.slots.read();
+            map.get(workspace_id)
+                .map(|s| (s.container_id.clone(), s.last_image_ref.clone()))
+                .unwrap_or((None, None))
+        };
+        sink.status(
+            workspace_id,
+            "error",
+            cid.as_deref(),
+            image.as_deref(),
+            Some(&detail),
+        );
     }
 }
 

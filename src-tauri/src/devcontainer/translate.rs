@@ -169,7 +169,14 @@ pub fn to_container_spec(
     ContainerSpec {
         name,
         image: image_ref,
-        command: None,
+        // Devcontainers spec defaults `overrideCommand` to true: replace
+        // the image's CMD/ENTRYPOINT with a long-running no-op so the
+        // container stays alive for `exec`-driven workflows. Without
+        // this, base images whose CMD exits immediately (e.g. `bash`
+        // without a TTY) leave us with a "stopped" container the moment
+        // `start` returns and `exec` then fails with "no sandbox
+        // client exists: container is stopped".
+        command: Some(vec!["/bin/sh".into(), "-c".into(), "while sleep 2147483647; do :; done".into()]),
         workdir: Some(workspace_target),
         env,
         mounts,

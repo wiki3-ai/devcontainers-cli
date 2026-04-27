@@ -225,6 +225,7 @@ impl ContainerRuntime for AppleContainersRuntime {
     }
 
     async fn start(&self, container_id: &str) -> Result<(), ContainerRuntimeError> {
+        ensure_container_id(container_id)?;
         run_capturing(&self.cli, ["start", container_id]).await?;
         // Apple's `container start` returns as soon as the start request is
         // accepted, but the runtime may still be transitioning the
@@ -249,19 +250,22 @@ impl ContainerRuntime for AppleContainersRuntime {
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), ContainerRuntimeError> {
+        ensure_container_id(container_id)?;
         run_capturing(&self.cli, ["stop", container_id]).await?;
         Ok(())
     }
 
     async fn remove(&self, container_id: &str, force: bool) -> Result<(), ContainerRuntimeError> {
+        ensure_container_id(container_id)?;
         let args = cli::remove_args(container_id, force);
         run_capturing(&self.cli, args.iter().map(String::as_str)).await?;
         Ok(())
     }
 
     async fn inspect(&self, container_id: &str) -> Result<ContainerStatus, ContainerRuntimeError> {
+        ensure_container_id(container_id)?;
         let (stdout, _) =
-            run_capturing(&self.cli, ["inspect", container_id, "--format", "json"]).await?;
+            run_capturing(&self.cli, ["inspect", container_id]).await?;
         cli::parse_inspect(&stdout)
     }
 
@@ -403,10 +407,14 @@ where
     ))
 }
 
-/// A `serde`-compatible shape for the subset of `container inspect` output
-/// the orchestrator cares about. Apple's CLI emits more fields; ignored
-/// fields are deserialised loosely so future schema additions don't break
-/// the parser.
+/// A `serde`-compatible shape for the subset of `container inspect` /
+/// `container list` output the orchestrator cares about.
+///
+/// Apple's CLI nests most identity fields under a `configuration` object
+/// (id, image, etc.) while runtime state lives at the top level
+/// (`status`, `startedDate`, `networks`). Older builds and our own
+/// fixtures sometimes put `id`/`image` at the top level too, so both
+/// shapes are accepted; the nested values win when present.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InspectShape {
@@ -416,6 +424,17 @@ pub(crate) struct InspectShape {
     pub status: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub image: Option<InspectImage>,
+    #[serde(default)]
+    pub configuration: Option<InspectConfiguration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InspectConfiguration {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub image: Option<InspectImage>,
 }
@@ -443,12 +462,38 @@ impl InspectShape {
             Some(ref s) if s == "created" => ContainerState::Created,
             _ => ContainerState::Unknown,
         };
+        let (cfg_id, cfg_image) = match self.configuration {
+            Some(c) => (c.id, c.image),
+            None => (None, None),
+        };
+        let container_id = cfg_id
+            .or(self.id)
+            .or(self.name)
+            .unwrap_or_default();
+        let image_ref = cfg_image
+            .or(self.image)
+            .and_then(|i| i.reference.or(i.name));
         ContainerStatus {
-            container_id: self.id.or(self.name).unwrap_or_default(),
+            container_id,
             state,
-            image_ref: self.image.and_then(|i| i.reference.or(i.name)),
+            image_ref,
         }
     }
+}
+
+/// Reject calls into the runtime with an empty container id. Apple's
+/// `container` CLI surfaces an empty argv as `notFound: container with
+/// ID  not found`, which is confusing and indistinguishable from a
+/// genuinely missing container; bail out earlier with a clear message
+/// so the dashboard can ignore the call (and the bug that produced the
+/// empty id is easier to spot).
+fn ensure_container_id(id: &str) -> Result<(), ContainerRuntimeError> {
+    if id.trim().is_empty() {
+        return Err(ContainerRuntimeError::Backend(
+            "missing container id (empty string passed to runtime)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Format a [`crate::container::MountSpec`] as the `--mount` flag value

@@ -284,12 +284,15 @@ function renderSidebar(): HTMLElement {
 			.map((s) => s?.containerId)
 			.filter((cid): cid is string => !!cid),
 	);
+	const systemContainers = state.containers.filter(isSystemContainer);
+	const userContainers = state.containers.filter((c) => !isSystemContainer(c));
+
 	const cHeader = document.createElement('h3');
 	cHeader.className = 'sidebar-section';
-	cHeader.textContent = `Containers (${state.containers.length})`;
+	cHeader.textContent = `Containers (${userContainers.length})`;
 	aside.appendChild(cHeader);
 
-	if (state.containers.length === 0) {
+	if (userContainers.length === 0) {
 		const empty = document.createElement('p');
 		empty.className = 'sidebar-empty';
 		empty.textContent = 'No containers.';
@@ -297,13 +300,56 @@ function renderSidebar(): HTMLElement {
 	} else {
 		const ul = document.createElement('ul');
 		ul.className = 'workspaces';
-		for (const c of state.containers) {
+		for (const c of userContainers) {
 			ul.appendChild(renderContainerItem(c, linkedCids.has(c.containerId)));
 		}
 		aside.appendChild(ul);
 	}
 
+	// --- System (BuildKit etc.) ---------------------------------------
+	if (systemContainers.length > 0) {
+		const sHeader = document.createElement('h3');
+		sHeader.className = 'sidebar-section';
+		sHeader.textContent = 'System';
+		aside.appendChild(sHeader);
+		const ul = document.createElement('ul');
+		ul.className = 'workspaces';
+		for (const c of systemContainers) {
+			ul.appendChild(renderSystemContainerItem(c));
+		}
+		aside.appendChild(ul);
+	}
+
 	return aside;
+}
+
+/** Containers managed by the runtime itself (not user dev containers).
+ *  Apple's `container` CLI runs a long-lived `buildkit` helper in the
+ *  same VM and lists it alongside everything else; without this filter
+ *  it would clutter the Containers section and tempt the user into
+ *  Stop/Remove actions that break image builds. */
+function isSystemContainer(c: ContainerEntry): boolean {
+	if (c.containerId === 'buildkit') return true;
+	const img = c.imageRef ?? '';
+	return img.includes('container-builder-shim');
+}
+
+function renderSystemContainerItem(c: ContainerEntry): HTMLElement {
+	const li = document.createElement('li');
+	li.dataset.kind = 'system';
+	li.dataset.id = c.containerId;
+	li.classList.add('system-entry');
+	const title = document.createElement('div');
+	title.className = 'ws-title';
+	title.textContent = c.containerId;
+	const meta = document.createElement('div');
+	meta.className = 'ws-path';
+	meta.textContent = c.imageRef ?? '';
+	const status = document.createElement('div');
+	status.className = `ws-status state-${c.state}`;
+	status.textContent = `${c.state} · runtime helper`;
+	li.append(title, meta, status);
+	return li;
 }
 
 function renderRepoItem(w: WorkspaceEntry): HTMLElement {

@@ -200,7 +200,10 @@ pub(crate) fn exec_args(container_id: &str, options: &ExecOptions) -> Vec<String
         a.push(format!("{k}={v}"));
     }
     a.push(container_id.to_string());
-    a.push("--".to_string());
+    // NOTE: Apple's `container exec` takes process arguments positionally
+    // straight after the container id; it does NOT accept a `--`
+    // separator (it would be interpreted as the executable name and
+    // fail with `failed to find target executable --`).
     for arg in &options.command {
         a.push(arg.clone());
     }
