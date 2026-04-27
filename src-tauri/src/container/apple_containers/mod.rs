@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
 use super::traits::{
     ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus,
@@ -227,18 +228,31 @@ where
     S: AsRef<OsStr>,
 {
     let mut cmd = cli.command();
+    let mut argv: Vec<String> = Vec::new();
     for a in args {
+        let s = a.as_ref().to_string_lossy().into_owned();
         cmd.arg(a);
+        argv.push(s);
     }
+    debug!(binary = %cli.binary(), argv = ?argv, "running container CLI");
     let output = cmd.output().await.map_err(|e| {
         ContainerRuntimeError::Backend(format!("failed to run `{}`: {e}", cli.binary()))
     })?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        warn!(
+            binary = %cli.binary(),
+            argv = ?argv,
+            status = %output.status,
+            stderr = %stderr,
+            "container CLI exited non-zero"
+        );
         return Err(ContainerRuntimeError::Backend(format!(
-            "`{}` exited with {}: {}",
+            "`{} {}` exited with {}: {}",
             cli.binary(),
+            argv.join(" "),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim(),
+            stderr,
         )));
     }
     Ok((

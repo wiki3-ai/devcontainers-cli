@@ -23,15 +23,31 @@ import {
 // Type-only reference to the engine module so the editor and (where it
 // runs) tsc validate our usage. The actual JS comes from the deno-built
 // bundle that lives in `frontend/public/devcontainer-engine.js` and is
-// loaded at runtime via dynamic import. `@vite-ignore` keeps Vite from
-// trying to resolve and bundle the spec slice itself, which uses
-// `node:path` and other Node built-ins that the deno bundler polyfills
-// but Vite does not.
+// loaded at runtime.
+//
+// We can't dynamic-`import('/devcontainer-engine.js')` directly: Vite 7
+// refuses to serve files under `/public/` as modules (they're meant to be
+// raw static assets), and `@vite-ignore` does not bypass that check. So
+// we fetch the bundle as text, wrap it in a blob URL, and import that.
+// The blob is opaque to Vite's plugin pipeline, and the file is still
+// served verbatim from `/public/` (dev) or `dist/` (build).
 type EngineModule = typeof import('./devcontainer-engine');
 let enginePromise: Promise<EngineModule> | undefined;
 function engine(): Promise<EngineModule> {
 	if (!enginePromise) {
-		enginePromise = import(/* @vite-ignore */ '/devcontainer-engine.js') as Promise<EngineModule>;
+		enginePromise = (async () => {
+			const res = await fetch('/devcontainer-engine.js');
+			if (!res.ok) {
+				throw new Error(`Failed to fetch engine bundle: ${res.status} ${res.statusText}`);
+			}
+			const code = await res.text();
+			const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+			try {
+				return (await import(/* @vite-ignore */ url)) as EngineModule;
+			} finally {
+				URL.revokeObjectURL(url);
+			}
+		})();
 	}
 	return enginePromise;
 }

@@ -44,6 +44,15 @@ pub struct ParsedDevContainer {
     pub name: Option<String>,
     #[serde(default)]
     pub image: Option<String>,
+    /// Raw `build` object (Dockerfile-based config). Carried through so
+    /// the host can detect-and-reject; the v1 lifecycle does not yet
+    /// build images.
+    #[serde(default)]
+    pub build: Option<serde_json::Value>,
+    /// Raw `dockerComposeFile` value (string or array). Carried through
+    /// for the same reason as `build`.
+    #[serde(default, rename = "dockerComposeFile")]
+    pub docker_compose_file: Option<serde_json::Value>,
     #[serde(default)]
     pub workspace_folder: Option<PathBuf>,
     #[serde(default)]
@@ -81,11 +90,17 @@ pub fn to_container_spec(
         .image
         .as_deref()
         .map(parse_image_ref)
-        .unwrap_or_else(|| ImageRef {
-            registry: None,
-            repository: "mcr.microsoft.com/devcontainers/base".to_string(),
-            tag: Some("ubuntu".to_string()),
-            digest: None,
+        .unwrap_or_else(|| {
+            // Caller is expected to validate via the lifecycle layer;
+            // this fallback only kicks in for old/incomplete callers
+            // (e.g. tests) and is intentionally obvious so it surfaces
+            // in logs rather than silently running a stand-in image.
+            ImageRef {
+                registry: None,
+                repository: "devcontainer-image-unspecified".to_string(),
+                tag: None,
+                digest: None,
+            }
         });
 
     let workspace_target = parsed.workspace_folder.clone().unwrap_or_else(|| {
@@ -126,11 +141,15 @@ pub fn to_container_spec(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    let raw_name = parsed
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
+    let name = sanitize_entity_name(&raw_name)
+        .unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
+
     ContainerSpec {
-        name: parsed
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("devcontainer-{workspace_id}")),
+        name,
         image: image_ref,
         command: None,
         workdir: Some(workspace_target),
@@ -140,6 +159,41 @@ pub fn to_container_spec(
         user: parsed.remote_user.clone(),
         privileged: false,
     }
+}
+
+/// Coerce an arbitrary devcontainer `name` (which is free-form, e.g.
+/// `"JupyterLite Demo"`) into a string that container runtimes will
+/// accept as an entity name. Apple's `container` CLI in particular
+/// rejects spaces and many punctuation characters with `invalid entity
+/// name`. We keep ASCII alphanumerics, dash and underscore; everything
+/// else collapses to a single dash. Returns `None` if nothing usable
+/// remains so the caller can fall back to a workspace-id based name.
+fn sanitize_entity_name(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut last_was_dash = false;
+    for c in input.chars() {
+        let keep = c.is_ascii_alphanumeric() || c == '-' || c == '_';
+        if keep {
+            out.push(c);
+            last_was_dash = c == '-';
+        } else if !last_was_dash && !out.is_empty() {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    // Container CLIs typically require the first character to be alpha-
+    // numeric; if we somehow ended up leading with `_` or `-`, drop them.
+    while out
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_ascii_alphanumeric())
+    {
+        out.remove(0);
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn parse_image_ref(s: &str) -> ImageRef {
@@ -184,6 +238,35 @@ mod tests {
         let r = parse_image_ref("node:20-alpine");
         assert_eq!(r.repository, "node");
         assert_eq!(r.tag.as_deref(), Some("20-alpine"));
+    }
+
+    #[test]
+    fn sanitize_entity_name_replaces_spaces_and_punctuation() {
+        assert_eq!(
+            sanitize_entity_name("JupyterLite Demo").as_deref(),
+            Some("JupyterLite-Demo")
+        );
+        assert_eq!(
+            sanitize_entity_name("  hello / world!  ").as_deref(),
+            Some("hello-world")
+        );
+        assert_eq!(
+            sanitize_entity_name("already_ok-1").as_deref(),
+            Some("already_ok-1")
+        );
+        assert_eq!(sanitize_entity_name("   "), None);
+        assert_eq!(sanitize_entity_name(""), None);
+    }
+
+    #[test]
+    fn to_container_spec_sanitizes_devcontainer_name() {
+        let parsed = ParsedDevContainer {
+            name: Some("JupyterLite Demo".into()),
+            image: Some("ubuntu:24.04".into()),
+            ..Default::default()
+        };
+        let spec = to_container_spec(&parsed, "ws-1", std::path::Path::new("/tmp/take-two"));
+        assert_eq!(spec.name, "JupyterLite-Demo");
     }
 
     #[test]

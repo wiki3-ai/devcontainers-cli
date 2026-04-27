@@ -69,4 +69,18 @@ impl RuntimeRegistry {
             .cloned()
             .expect("selected runtime must be registered")
     }
+
+    /// Test helper: build a registry with exactly one backend, already
+    /// selected. Lets the lifecycle orchestrator be exercised end-to-end
+    /// against a fake `ContainerRuntime` without touching the real
+    /// Apple/Podman/Docker backends.
+    #[doc(hidden)]
+    pub fn with_single(id: RuntimeId, backend: Arc<dyn ContainerRuntime>) -> Self {
+        let mut backends: HashMap<RuntimeId, Arc<dyn ContainerRuntime>> = HashMap::new();
+        backends.insert(id, backend);
+        Self {
+            backends,
+            selected: RwLock::new(id),
+        }
+    }
 }

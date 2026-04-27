@@ -49,9 +49,20 @@ scripts/mac-dev.sh
 # == cd src-tauri && cargo tauri dev
 ```
 
-This honors `tauri.conf.json`'s `beforeDevCommand` (`yarn --cwd ../frontend
+This honors `tauri.conf.json`'s `beforeDevCommand` (`yarn --cwd frontend
 dev` on `http://localhost:1420`), so Vite + the Rust host come up together
 with hot reload.
+
+To crank up Rust-side logging, set `RUST_LOG` before launching:
+
+```sh
+RUST_LOG=devcontainers_app_lib=debug scripts/mac-dev.sh
+```
+
+Lifecycle stages (`pull`, `create`, `start`, `exec`, hooks) emit `tracing`
+events at `info`, with the `container` CLI's stderr captured at `error`
+on failure. The same details are forwarded to the WebView as
+`devcontainer://log` events so they show up in the in-app terminal.
 
 ## 4. Release build (`.app` / `.dmg`)
 
@@ -86,3 +97,29 @@ Real signing/notarization is out of scope until later in the roadmap.
 Use [.devcontainer/](../.devcontainer/) when you want to reproduce the CI
 matrix — Rust lints, Deno bundle, spec typecheck — in a clean Linux env.
 Use the macOS host scripts above when you want to **run** the app.
+
+## Notes for future-us
+
+### How the WebView loads the engine bundle
+
+The deno-built spec slice (`dist/devcontainer-engine.js`) is copied by
+[scripts/build-engine.ts](../scripts/build-engine.ts) into
+`frontend/public/devcontainer-engine.js`. Files under `frontend/public/`
+are served verbatim by Vite (and copied verbatim into `frontend/dist/`
+at build time), which is what we want — the engine bundle has its own
+Node polyfills baked in via esbuild, and we don't want Vite/Rollup
+rewriting any of it.
+
+Vite 7 deliberately refuses to **`import()`** modules out of `/public/`,
+even with `/* @vite-ignore */`, because public assets are not meant to go
+through the module pipeline. So [frontend/src/main.ts](../frontend/src/main.ts)
+`fetch()`s the bundle as text, wraps it in a `Blob`, and dynamic-imports
+the resulting `blob:` URL. The blob URL is opaque to Vite and the
+browser treats it as a fully-formed ES module.
+
+If you ever need to tighten the Tauri WebView CSP in
+[src-tauri/tauri.conf.json](../src-tauri/tauri.conf.json), make sure
+`script-src` keeps `blob:` (or `'unsafe-inline'` is already broad enough
+to include it via the dev `csp_dev` override). Without it, the engine
+dynamic import will fail in the packaged release build with a CSP
+violation.

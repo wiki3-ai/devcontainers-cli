@@ -71,6 +71,8 @@ export function tauriFileHost(): FileHost {
 export interface ParsedDevContainer {
 	name?: string;
 	image?: string;
+	build?: unknown;
+	dockerComposeFile?: unknown;
 	workspaceFolder?: string;
 	workspaceMount?: string;
 	mounts: string[];
@@ -147,6 +149,8 @@ export async function loadDevContainerConfig(
 export function toParsed(config: DevContainerConfig): ParsedDevContainer {
 	const c = config as DevContainerConfig & {
 		image?: string;
+		build?: unknown;
+		dockerComposeFile?: unknown;
 		mounts?: (Mount | string)[];
 		forwardPorts?: (number | string)[];
 		workspaceFolder?: string;
@@ -169,6 +173,8 @@ export function toParsed(config: DevContainerConfig): ParsedDevContainer {
 	return {
 		name: c.name,
 		image: c.image,
+		build: c.build,
+		dockerComposeFile: c.dockerComposeFile,
 		workspaceFolder: c.workspaceFolder,
 		workspaceMount: c.workspaceMount,
 		mounts,
