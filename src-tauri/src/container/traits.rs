@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -114,6 +115,39 @@ pub struct ExecResult {
     pub stderr: Vec<u8>,
 }
 
+/// Which stream a [`LogChunk`] came from. The `system` variant is reserved
+/// for orchestrator-injected log lines (e.g. "starting container…") that the
+/// runtime did not produce itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStreamKind {
+    Stdout,
+    Stderr,
+    System,
+}
+
+/// One line of container output, as produced by `runtime.logs(...)` or by
+/// the lifecycle orchestrator's hook execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogChunk {
+    pub stream: LogStreamKind,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogOptions {
+    /// Stream new output as it is produced. When false, returns historical
+    /// logs and closes the channel.
+    pub follow: bool,
+    /// If set, only the last `tail` lines of historical output are returned.
+    pub tail: Option<usize>,
+}
+
+/// Streaming log handle. Dropping the underlying receiver should be enough
+/// to cause the backend to abort its log task; implementations are expected
+/// to detect a closed channel and stop the child process.
+pub type LogStream = mpsc::Receiver<LogChunk>;
+
 /// The seam through which the lifecycle orchestrator drives any container
 /// engine. All operations are async; long-running ones (logs, events,
 /// `exec` with PTY) belong with the streaming APIs added in step 7.
@@ -138,6 +172,15 @@ pub trait ContainerRuntime: Send + Sync {
         container_id: &str,
         options: &ExecOptions,
     ) -> Result<ExecResult, ContainerRuntimeError>;
+
+    /// Stream container logs. When `options.follow` is true, the returned
+    /// receiver yields lines until the container exits or the receiver is
+    /// dropped (which should abort the backend's log task).
+    async fn logs(
+        &self,
+        container_id: &str,
+        options: &LogOptions,
+    ) -> Result<LogStream, ContainerRuntimeError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

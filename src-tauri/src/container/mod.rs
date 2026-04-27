@@ -12,7 +12,8 @@ pub mod traits;
 
 pub use traits::{
     ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus,
-    ExecOptions, ExecResult, ImageRef, MountKind, MountSpec, PortForward, PortProtocol, RuntimeId,
+    ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream, LogStreamKind, MountKind,
+    MountSpec, PortForward, PortProtocol, RuntimeAvailability, RuntimeId,
 };
 
 use std::collections::HashMap;

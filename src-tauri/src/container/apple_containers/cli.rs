@@ -1,0 +1,228 @@
+//! `container` CLI surface used by [`super::AppleContainersRuntime`].
+//!
+//! Building the argv vectors as pure functions keeps the wire format
+//! testable without a real `container` binary on `$PATH`.
+
+use tokio::process::Command;
+
+use crate::container::traits::{
+    ContainerRuntimeError, ContainerSpec, ContainerStatus, ExecOptions, ImageRef, LogOptions,
+};
+
+use super::{mount_flag, InspectShape};
+
+#[derive(Debug, Clone)]
+pub struct ContainerCli {
+    binary: String,
+}
+
+impl ContainerCli {
+    pub fn new(binary: impl Into<String>) -> Self {
+        Self {
+            binary: binary.into(),
+        }
+    }
+
+    pub fn binary(&self) -> &str {
+        &self.binary
+    }
+
+    pub fn command(&self) -> Command {
+        Command::new(&self.binary)
+    }
+}
+
+impl Default for ContainerCli {
+    fn default() -> Self {
+        Self::new("container")
+    }
+}
+
+/// Format an [`ImageRef`] back into the canonical `[registry/]repo[:tag][@digest]`
+/// string accepted by `container image pull`.
+pub(crate) fn image_ref_to_string(image: &ImageRef) -> String {
+    let mut s = String::new();
+    if let Some(reg) = &image.registry {
+        s.push_str(reg);
+        s.push('/');
+    }
+    s.push_str(&image.repository);
+    if let Some(tag) = &image.tag {
+        s.push(':');
+        s.push_str(tag);
+    }
+    if let Some(d) = &image.digest {
+        s.push('@');
+        s.push_str(d);
+    }
+    s
+}
+
+pub(crate) fn pull_args(image: &ImageRef) -> Vec<String> {
+    vec![
+        "image".to_string(),
+        "pull".to_string(),
+        image_ref_to_string(image),
+    ]
+}
+
+pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<String> {
+    let mut a = vec![
+        "create".to_string(),
+        "--name".to_string(),
+        spec.name.clone(),
+    ];
+
+    for (k, v) in &spec.env {
+        a.push("--env".to_string());
+        a.push(format!("{k}={v}"));
+    }
+    // Sort so argv is deterministic regardless of HashMap iteration order.
+    sort_kv_block(&mut a, "--env");
+
+    for m in &spec.mounts {
+        a.push("--mount".to_string());
+        a.push(mount_flag(m));
+    }
+
+    for p in &spec.ports {
+        a.push("--publish".to_string());
+        let proto = match p.protocol {
+            crate::container::PortProtocol::Tcp => "tcp",
+            crate::container::PortProtocol::Udp => "udp",
+        };
+        a.push(format!("{}:{}/{proto}", p.host_port, p.container_port));
+    }
+
+    if let Some(workdir) = &spec.workdir {
+        a.push("--workdir".to_string());
+        a.push(workdir.display().to_string());
+    }
+    if let Some(user) = &spec.user {
+        a.push("--user".to_string());
+        a.push(user.clone());
+    }
+    if spec.privileged {
+        a.push("--privileged".to_string());
+    }
+
+    a.push(image_ref_to_string(&spec.image));
+    if let Some(cmd) = &spec.command {
+        for arg in cmd {
+            a.push(arg.clone());
+        }
+    }
+    a
+}
+
+/// Sort consecutive `flag value` pairs in-place so the argv we emit is
+/// deterministic for tests. Pairs not matching `flag` are left alone.
+fn sort_kv_block(args: &mut Vec<String>, flag: &str) {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            let start = i;
+            let mut end = i;
+            while end + 1 < args.len() && args[end] == flag {
+                end += 2;
+            }
+            // `end` now points at one past the last value in the block.
+            let mut pairs: Vec<(String, String)> = args[start..end]
+                .chunks(2)
+                .map(|c| (c[0].clone(), c[1].clone()))
+                .collect();
+            pairs.sort_by(|a, b| a.1.cmp(&b.1));
+            let mut flat: Vec<String> = Vec::with_capacity(end - start);
+            for (k, v) in pairs {
+                flat.push(k);
+                flat.push(v);
+            }
+            args.splice(start..end, flat);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+pub(crate) fn remove_args(container_id: &str, force: bool) -> Vec<String> {
+    let mut a = vec!["delete".to_string()];
+    if force {
+        a.push("--force".to_string());
+    }
+    a.push(container_id.to_string());
+    a
+}
+
+pub(crate) fn exec_args(container_id: &str, options: &ExecOptions) -> Vec<String> {
+    let mut a = vec!["exec".to_string()];
+    if options.tty {
+        a.push("--tty".to_string());
+    }
+    if let Some(workdir) = &options.workdir {
+        a.push("--workdir".to_string());
+        a.push(workdir.display().to_string());
+    }
+    if let Some(user) = &options.user {
+        a.push("--user".to_string());
+        a.push(user.clone());
+    }
+    let mut envs: Vec<(&String, &String)> = options.env.iter().collect();
+    envs.sort_by(|x, y| x.0.cmp(y.0));
+    for (k, v) in envs {
+        a.push("--env".to_string());
+        a.push(format!("{k}={v}"));
+    }
+    a.push(container_id.to_string());
+    a.push("--".to_string());
+    for arg in &options.command {
+        a.push(arg.clone());
+    }
+    a
+}
+
+pub(crate) fn logs_args(container_id: &str, options: &LogOptions) -> Vec<String> {
+    let mut a = vec!["logs".to_string()];
+    if options.follow {
+        a.push("--follow".to_string());
+    }
+    if let Some(t) = options.tail {
+        a.push("--tail".to_string());
+        a.push(t.to_string());
+    }
+    a.push(container_id.to_string());
+    a
+}
+
+pub(crate) fn parse_inspect(stdout: &str) -> Result<ContainerStatus, ContainerRuntimeError> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(ContainerRuntimeError::Backend(
+            "`container inspect` returned empty output".into(),
+        ));
+    }
+    // Apple's CLI sometimes wraps a single object in a one-element array.
+    if let Ok(arr) = serde_json::from_str::<Vec<InspectShape>>(trimmed) {
+        if let Some(first) = arr.into_iter().next() {
+            return Ok(first.into_status());
+        }
+        return Err(ContainerRuntimeError::Backend(
+            "`container inspect` returned an empty array".into(),
+        ));
+    }
+    let one: InspectShape = serde_json::from_str(trimmed).map_err(|e| {
+        ContainerRuntimeError::Backend(format!("could not parse `container inspect`: {e}"))
+    })?;
+    Ok(one.into_status())
+}
+
+pub(crate) fn parse_list(stdout: &str) -> Result<Vec<ContainerStatus>, ContainerRuntimeError> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arr: Vec<InspectShape> = serde_json::from_str(trimmed).map_err(|e| {
+        ContainerRuntimeError::Backend(format!("could not parse `container list`: {e}"))
+    })?;
+    Ok(arr.into_iter().map(InspectShape::into_status).collect())
+}
