@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as path from 'node:path';
+import type * as path from 'node:path';
 
 export interface Workspace {
 	readonly isWorkspaceFile: boolean;
@@ -30,6 +30,11 @@ export function workspaceFromPath(path_: typeof path.posix | typeof path.win32, 
 	};
 }
 
+const WORKSPACE_FILE_SUFFIX = '.code-workspace';
+
 export function isWorkspacePath(workspaceOrFolderPath: string) {
-	return path.extname(workspaceOrFolderPath) === '.code-workspace';
+	// String-only test: avoids dragging `node:path.extname` into the spec
+	// slice. The slice never imports a runtime `path` module — all path
+	// operations come through the `FileHost.path` injected by the host.
+	return workspaceOrFolderPath.endsWith(WORKSPACE_FILE_SUFFIX);
 }
