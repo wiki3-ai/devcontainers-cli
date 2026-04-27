@@ -16,3 +16,9 @@ src/test/container-features/configs/temp_lifecycle-hooks-alternative-order
 test-secrets-temp.json
 src/test/container-*/**/src/**/README.md
 !src/test/container-features/assets/*.tgz
+
+# Tauri / Deno conversion outputs
+/src-tauri/target/
+/frontend/dist/
+/frontend/node_modules/
+.deno/

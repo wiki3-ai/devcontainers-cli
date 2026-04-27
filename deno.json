@@ -1,0 +1,45 @@
+{
+	"name": "devcontainers-app-engine",
+	"version": "0.1.0",
+	"exports": "./spec/index.ts",
+	"description": "Deno build of the devcontainer-spec slice consumed by the Tauri 2 app's WebView.",
+	"tasks": {
+		"check": "deno check spec/index.ts frontend/src/devcontainer-engine/index.ts",
+		"build": "deno run --allow-read --allow-write --allow-env --allow-run --allow-net scripts/build-engine.ts",
+		"build:check-no-node-builtins": "deno run --allow-read scripts/check-no-node-builtins.ts dist/devcontainer-engine.js"
+	},
+	"imports": {
+		"vscode-uri": "npm:vscode-uri@^3.1.0",
+		"jsonc-parser": "npm:jsonc-parser@^3.3.1",
+		"esbuild": "npm:esbuild@^0.27.3",
+		"esbuild-plugin-polyfill-node": "npm:esbuild-plugin-polyfill-node@^0.3.0",
+		"@tauri-apps/api/core": "npm:@tauri-apps/api@^2.9.0/core",
+		"@tauri-apps/api/event": "npm:@tauri-apps/api@^2.9.0/event"
+	},
+	"compilerOptions": {
+		"lib": ["ES2022", "DOM", "deno.window"],
+		"strict": true
+	},
+	"unstable": ["sloppy-imports"],
+	"nodeModulesDir": "auto",
+	"fmt": {
+		"useTabs": true,
+		"lineWidth": 200,
+		"singleQuote": true,
+		"semiColons": true
+	},
+	"lint": {
+		"rules": {
+			"tags": ["recommended"]
+		}
+	},
+	"exclude": [
+		"src/",
+		"built/",
+		"dist/",
+		"node_modules/",
+		"src-tauri/target/",
+		"frontend/node_modules/",
+		"frontend/dist/"
+	]
+}

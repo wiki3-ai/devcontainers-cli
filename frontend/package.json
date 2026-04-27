@@ -1,0 +1,20 @@
+{
+	"name": "devcontainers-app-frontend",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Vite TypeScript frontend for Devcontainers.app. Built with Vite at dev-time; the devcontainer engine module is built separately by Deno (see deno.json).",
+	"scripts": {
+		"dev": "vite",
+		"build": "tsc --noEmit && vite build",
+		"preview": "vite preview",
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@tauri-apps/api": "^2.0.0"
+	},
+	"devDependencies": {
+		"typescript": "^5.9.3",
+		"vite": "^7.3.2"
+	}
+}
