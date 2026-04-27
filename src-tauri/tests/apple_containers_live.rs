@@ -52,13 +52,16 @@ fn exec_opts(cmd: &[&str]) -> ExecOptions {
 /// sibling state directory so successive invocations interact like the
 /// real CLI does.
 fn fake_container_script() -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "devcontainers-fake-{}-{}",
+        "devcontainers-fake-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let state = dir.join("state");
@@ -423,84 +426,4 @@ async fn start_polls_inspect_until_running() {
     assert_eq!(status.state, ContainerState::Running);
 }
 
-// ---------------------------------------------------------------------------
-// Optional: drive the real `container` CLI when present.
-//
-// These are gated on:
-//   * `apple-containers-live` cargo feature (already required for the
-//     module),
-//   * the `DEVCONTAINERS_LIVE_REAL=1` environment variable so CI doesn't
-//     accidentally start containers,
-//   * `container --version` succeeding.
-//
-// They run a minimal lifecycle (create → start → inspect → exec → stop
-// → delete) against a small base image, primarily to detect upstream
-// behaviour drift in fields we depend on.
-// ---------------------------------------------------------------------------
-
-fn real_cli_available() -> bool {
-    if std::env::var("DEVCONTAINERS_LIVE_REAL").as_deref() != Ok("1") {
-        return false;
-    }
-    std::process::Command::new("container")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-#[tokio::test]
-async fn real_cli_minimal_lifecycle() {
-    if !real_cli_available() {
-        eprintln!(
-            "skipping: set DEVCONTAINERS_LIVE_REAL=1 and ensure `container` is on PATH"
-        );
-        return;
-    }
-    let rt = AppleContainersRuntime::with_binary("container");
-    let name = format!(
-        "devcontainers-it-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    );
-    let img = ImageRef {
-        registry: None,
-        repository: "library/alpine".into(),
-        tag: Some("3.19".into()),
-        digest: None,
-    };
-    let _ = rt.pull(&img).await; // best effort
-
-    let mut s = spec(&name);
-    s.image = img;
-    let cid = rt.create(&s).await.expect("create");
-
-    // Best-effort cleanup if any assertion below fails.
-    struct Cleanup(String);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("container")
-                .args(["delete", "--force", &self.0])
-                .status();
-        }
-    }
-    let _cleanup = Cleanup(cid.clone());
-
-    rt.start(&cid).await.expect("start");
-    let status = rt.inspect(&cid).await.expect("inspect");
-    assert_eq!(status.state, ContainerState::Running, "must be running after start");
-    assert!(!status.container_id.is_empty(), "container_id must be parsed");
-    assert!(status.image_ref.is_some(), "image_ref must be parsed");
-
-    let result = rt
-        .exec(&cid, &exec_opts(&["/bin/sh", "-c", "echo from-real-cli"]))
-        .await
-        .expect("exec");
-    assert_eq!(result.exit_code, 0);
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(stdout.contains("from-real-cli"), "stdout: {stdout}");
-
-    rt.stop(&cid).await.expect("stop");
-}
+// Real-CLI integration tests live in `tests/apple_containers_real.rs`.

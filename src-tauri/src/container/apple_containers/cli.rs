@@ -223,7 +223,10 @@ pub(crate) fn logs_args(container_id: &str, options: &LogOptions) -> Vec<String>
     a
 }
 
-pub(crate) fn parse_inspect(stdout: &str) -> Result<ContainerStatus, ContainerRuntimeError> {
+pub(crate) fn parse_inspect(
+    stdout: &str,
+    container_id: &str,
+) -> Result<ContainerStatus, ContainerRuntimeError> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Err(ContainerRuntimeError::Backend(
@@ -235,9 +238,13 @@ pub(crate) fn parse_inspect(stdout: &str) -> Result<ContainerStatus, ContainerRu
         if let Some(first) = arr.into_iter().next() {
             return Ok(first.into_status());
         }
-        return Err(ContainerRuntimeError::Backend(
-            "`container inspect` returned an empty array".into(),
-        ));
+        // Apple's `container inspect <unknown>` exits 0 with `[]` instead
+        // of erroring. Surface this as a recognisable "not found" so the
+        // orchestrator's adoption / remove-on-rebuild paths can branch
+        // on it via `is_not_found`.
+        return Err(ContainerRuntimeError::Backend(format!(
+            "container with ID {container_id} not found"
+        )));
     }
     let one: InspectShape = serde_json::from_str(trimmed).map_err(|e| {
         ContainerRuntimeError::Backend(format!("could not parse `container inspect`: {e}"))

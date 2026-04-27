@@ -266,7 +266,7 @@ impl ContainerRuntime for AppleContainersRuntime {
         ensure_container_id(container_id)?;
         let (stdout, _) =
             run_capturing(&self.cli, ["inspect", container_id]).await?;
-        cli::parse_inspect(&stdout)
+        cli::parse_inspect(&stdout, container_id)
     }
 
     async fn list(&self) -> Result<Vec<ContainerStatus>, ContainerRuntimeError> {

@@ -176,27 +176,32 @@ fn logs_args_follow_and_tail() {
 #[test]
 fn parse_inspect_object_and_array() {
     let one = r#"{"id":"abc","status":"running","image":{"reference":"ubuntu:24.04"}}"#;
-    let s = parse_inspect(one).unwrap();
+    let s = parse_inspect(one, "abc").unwrap();
     assert_eq!(s.container_id, "abc");
     assert_eq!(s.state, ContainerState::Running);
     assert_eq!(s.image_ref.as_deref(), Some("ubuntu:24.04"));
 
     let many = r#"[{"id":"x","status":"stopped"}]"#;
-    let s = parse_inspect(many).unwrap();
+    let s = parse_inspect(many, "x").unwrap();
     assert_eq!(s.container_id, "x");
     assert_eq!(s.state, ContainerState::Stopped);
 }
 
 #[test]
 fn parse_inspect_unknown_state() {
-    let s = parse_inspect(r#"{"id":"y"}"#).unwrap();
+    let s = parse_inspect(r#"{"id":"y"}"#, "y").unwrap();
     assert_eq!(s.state, ContainerState::Unknown);
 }
 
 #[test]
 fn parse_inspect_rejects_empty() {
-    assert!(parse_inspect("").is_err());
-    assert!(parse_inspect("[]").is_err());
+    assert!(parse_inspect("", "anything").is_err());
+    // Empty array means "not found" — surfaced with that exact phrase
+    // so `is_not_found` in the orchestrator recognises it.
+    let err = parse_inspect("[]", "ghost").unwrap_err();
+    let msg = format!("{err}").to_ascii_lowercase();
+    assert!(msg.contains("not found"), "got: {msg}");
+    assert!(msg.contains("ghost"), "got: {msg}");
 }
 
 #[test]
