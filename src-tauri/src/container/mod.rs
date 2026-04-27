@@ -11,9 +11,9 @@ pub mod podman;
 pub mod traits;
 
 pub use traits::{
-    ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus,
-    ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream, LogStreamKind, MountKind,
-    MountSpec, PortForward, PortProtocol, RuntimeAvailability, RuntimeId,
+    BuildSpec, ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState,
+    ContainerStatus, ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream,
+    LogStreamKind, MountKind, MountSpec, PortForward, PortProtocol, RuntimeAvailability, RuntimeId,
 };
 
 use std::collections::HashMap;

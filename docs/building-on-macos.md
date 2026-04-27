@@ -59,10 +59,14 @@ To crank up Rust-side logging, set `RUST_LOG` before launching:
 RUST_LOG=devcontainers_app_lib=debug scripts/mac-dev.sh
 ```
 
-Lifecycle stages (`pull`, `create`, `start`, `exec`, hooks) emit `tracing`
-events at `info`, with the `container` CLI's stderr captured at `error`
-on failure. The same details are forwarded to the WebView as
+Lifecycle stages (`pull`, `build`, `create`, `start`, `exec`, hooks) emit
+`tracing` events at `info`, with the `container` CLI's stderr captured at
+`error` on failure. The same details are forwarded to the WebView as
 `devcontainer://log` events so they show up in the in-app terminal.
+
+For what each `devcontainer.json` field maps to (and what's intentionally
+unsupported, like `dockerComposeFile`), see
+[devcontainer-config-support.md](devcontainer-config-support.md).
 
 ## 4. Release build (`.app` / `.dmg`)
 

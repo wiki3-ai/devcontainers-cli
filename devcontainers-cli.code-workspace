@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../../Wiki3/take-two"
+		},
+		{
+			"path": "../wiki3-app"
 		}
 	]
 }

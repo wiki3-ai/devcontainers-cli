@@ -68,11 +68,24 @@ export function tauriFileHost(): FileHost {
  * since `tauri::command` rewrites camelCase JS keys to snake_case
  * automatically.
  */
+export interface DevContainerBuild {
+	dockerfile?: string;
+	context?: string;
+	args?: Record<string, string>;
+	target?: string;
+}
+
 export interface ParsedDevContainer {
 	name?: string;
 	image?: string;
-	build?: unknown;
+	build?: DevContainerBuild;
 	dockerComposeFile?: unknown;
+	/**
+	 * Absolute filesystem path of the `devcontainer.json` we loaded, so
+	 * the Rust host can resolve `build.dockerfile` / `build.context`
+	 * relative to its parent directory (the `.devcontainer/` folder).
+	 */
+	configFilePath?: string;
 	workspaceFolder?: string;
 	workspaceMount?: string;
 	mounts: string[];
@@ -135,7 +148,7 @@ export async function loadDevContainerConfig(
 
 	return {
 		configFilePath: uri.toString(),
-		parsed: toParsed(substituted),
+		parsed: toParsed(substituted, uri.fsPath),
 		raw: substituted,
 	};
 }
@@ -146,10 +159,15 @@ export async function loadDevContainerConfig(
  * dockerFile-based configs land in later phases — for v1 the orchestrator
  * only consumes image-based configs.
  */
-export function toParsed(config: DevContainerConfig): ParsedDevContainer {
+export function toParsed(config: DevContainerConfig, configFilePath?: string): ParsedDevContainer {
 	const c = config as DevContainerConfig & {
 		image?: string;
-		build?: unknown;
+		build?: {
+			dockerfile?: string;
+			context?: string;
+			args?: Record<string, string | number | boolean>;
+			target?: string;
+		};
 		dockerComposeFile?: unknown;
 		mounts?: (Mount | string)[];
 		forwardPorts?: (number | string)[];
@@ -170,11 +188,24 @@ export function toParsed(config: DevContainerConfig): ParsedDevContainer {
 	const forwardPorts = (c.forwardPorts ?? [])
 		.map((p) => (typeof p === 'number' ? p : Number.parseInt(p, 10)))
 		.filter((p) => Number.isFinite(p) && p > 0 && p < 65536);
+	const build: DevContainerBuild | undefined = c.build
+		? {
+			dockerfile: c.build.dockerfile,
+			context: c.build.context,
+			target: c.build.target,
+			args: c.build.args
+				? Object.fromEntries(
+					Object.entries(c.build.args).map(([k, v]) => [k, String(v)]),
+				)
+				: undefined,
+		}
+		: undefined;
 	return {
 		name: c.name,
 		image: c.image,
-		build: c.build,
+		build,
 		dockerComposeFile: c.dockerComposeFile,
+		configFilePath,
 		workspaceFolder: c.workspaceFolder,
 		workspaceMount: c.workspaceMount,
 		mounts,

@@ -31,31 +31,56 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::container::{
-    ContainerRuntime, ContainerRuntimeError, ExecOptions, LogStreamKind, RuntimeRegistry,
+    BuildSpec, ContainerRuntime, ContainerRuntimeError, ExecOptions, ImageRef, LogChunk,
+    LogStreamKind, RuntimeRegistry,
 };
-use crate::devcontainer::translate::{to_container_spec, LifecycleCommand, ParsedDevContainer};
+use crate::devcontainer::translate::{
+    parse_image_ref, to_container_spec, DevContainerBuild, LifecycleCommand, ParsedDevContainer,
+};
 
-/// Reject devcontainer configs that name features the v1 host can't yet
-/// honour, so we surface an explicit error instead of silently launching
-/// the wrong image. Today: `build.dockerfile` and `dockerComposeFile`
-/// are not implemented; users must specify `image`.
+/// Reject only what we genuinely cannot run yet. Today that's compose;
+/// `image` and `build` (Dockerfile) are both supported.
 fn validate_supported(parsed: &ParsedDevContainer) -> Result<(), LifecycleError> {
-    if parsed.image.is_some() {
-        return Ok(());
-    }
-    if parsed.build.is_some() {
-        return Err(LifecycleError::Unsupported(
-            "`build` (Dockerfile) is not yet implemented in v1; please set an `image` field on the devcontainer.json or wait for build support".into(),
-        ));
-    }
     if parsed.docker_compose_file.is_some() {
         return Err(LifecycleError::Unsupported(
-            "`dockerComposeFile` is not yet implemented in v1; please set an `image` field on the devcontainer.json".into(),
+            "`dockerComposeFile` is not supported \u{2014} this app uses a one-container-per-repo model. Replace the compose file with an `image` or `build` stanza.".into(),
         ));
     }
-    Err(LifecycleError::Unsupported(
-        "devcontainer.json must specify an `image` field (build/compose support not yet implemented)".into(),
-    ))
+    if parsed.image.is_none() && parsed.build.is_none() {
+        return Err(LifecycleError::Unsupported(
+            "devcontainer.json must specify either `image` or `build`".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Coerce an arbitrary slug into a valid OCI image tag fragment:
+/// lowercase, `[a-z0-9._-]` only, max 128 chars. Empty/all-bad input
+/// collapses to `workspace` so we always produce a runnable tag.
+fn sanitize_image_tag(input: &str) -> String {
+    let mut out: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.starts_with(['-', '.', '_']) {
+        out.remove(0);
+    }
+    while out.ends_with(['-', '.', '_']) {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("workspace");
+    }
+    if out.len() > 128 {
+        out.truncate(128);
+    }
+    out
 }
 
 #[derive(Debug, Error)]
@@ -302,6 +327,129 @@ impl LifecycleOrchestrator {
         result
     }
 
+    /// Decide whether to pull a pre-built image or build one from a
+    /// Dockerfile, returning the resulting [`ImageRef`]. Build output
+    /// is streamed to `sink` line-by-line.
+    async fn resolve_image(
+        &self,
+        sink: &dyn EventSink,
+        runtime: &dyn ContainerRuntime,
+        workspace_id: &str,
+        host_workspace: &Path,
+        parsed: &ParsedDevContainer,
+    ) -> Result<ImageRef, LifecycleError> {
+        if let Some(build) = parsed.build.as_ref() {
+            let build_spec = self.resolve_build_spec(workspace_id, host_workspace, parsed, build);
+            sink.status(
+                workspace_id,
+                "building",
+                None,
+                Some(&build_spec.tag.repository),
+                None,
+            );
+            sink.log(
+                workspace_id,
+                LogStreamKind::System,
+                &format!(
+                    "building image {} from {}",
+                    build_spec.tag.repository,
+                    build_spec.dockerfile.display()
+                ),
+            );
+            debug!(
+                workspace = workspace_id,
+                dockerfile = %build_spec.dockerfile.display(),
+                context = %build_spec.context_dir.display(),
+                "stage=build begin"
+            );
+
+            // Bounded channel so a slow consumer can't grow memory.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<LogChunk>(256);
+            // Spawn a forwarder that copies chunks to the sink as they
+            // arrive. We use AbortHandle so we can join cleanly.
+            let workspace = workspace_id.to_string();
+            let pump_sink: std::sync::Arc<parking_lot::Mutex<Vec<LogChunk>>> =
+                std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let pump_buf = pump_sink.clone();
+            let pump = tokio::spawn(async move {
+                let _ = workspace; // captured for tracing if we want it
+                while let Some(chunk) = rx.recv().await {
+                    pump_buf.lock().push(chunk);
+                }
+            });
+
+            let result = runtime.build(&build_spec, Some(tx)).await;
+            // Channel closes when `runtime.build` returns and drops its
+            // sender; pump task exits on its own.
+            let _ = pump.await;
+            for chunk in pump_sink.lock().drain(..) {
+                sink.log(workspace_id, chunk.stream, &chunk.line);
+            }
+            let image_ref = stage("build", result)?;
+            debug!(workspace = workspace_id, "stage=build end");
+            Ok(image_ref)
+        } else {
+            let image_str = parsed
+                .image
+                .as_deref()
+                .expect("validate_supported guarantees image or build");
+            let image_ref = parse_image_ref(image_str);
+            sink.status(
+                workspace_id,
+                "pulling",
+                None,
+                Some(&image_ref.repository),
+                None,
+            );
+            sink.log(
+                workspace_id,
+                LogStreamKind::System,
+                &format!("pulling image {}", image_ref.repository),
+            );
+            debug!(workspace = workspace_id, "stage=pull begin");
+            stage("pull", runtime.pull(&image_ref).await)?;
+            debug!(workspace = workspace_id, "stage=pull end");
+            Ok(image_ref)
+        }
+    }
+
+    /// Resolve the parsed build stanza into an absolute [`BuildSpec`].
+    /// Per the upstream spec, `dockerfile` and `context` are relative to
+    /// the `.devcontainer/` folder (the parent of `devcontainer.json`).
+    fn resolve_build_spec(
+        &self,
+        workspace_id: &str,
+        host_workspace: &Path,
+        parsed: &ParsedDevContainer,
+        build: &DevContainerBuild,
+    ) -> BuildSpec {
+        let cfg_dir: std::path::PathBuf = parsed
+            .config_file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| host_workspace.join(".devcontainer"));
+
+        let dockerfile = cfg_dir.join(build.dockerfile.as_deref().unwrap_or("Dockerfile"));
+        let context_dir = cfg_dir.join(build.context.as_deref().unwrap_or("."));
+
+        let workspace_slug = host_workspace
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(workspace_id);
+        let tag = parse_image_ref(&format!(
+            "devcontainer-{}:latest",
+            sanitize_image_tag(workspace_slug)
+        ));
+
+        BuildSpec {
+            tag,
+            context_dir,
+            dockerfile,
+            build_args: build.args.clone(),
+            target: build.target.clone(),
+        }
+    }
+
     async fn up_inner(
         &self,
         sink: &dyn EventSink,
@@ -312,7 +460,13 @@ impl LifecycleOrchestrator {
         let parsed = self.parsed(workspace_id)?;
         let runtime = registry.selected();
         validate_supported(&parsed)?;
-        let spec = to_container_spec(&parsed, workspace_id, host_workspace);
+
+        // Resolve the image: either pull a pre-built one, or build from a
+        // Dockerfile. The result is the ImageRef we hand to `create`.
+        let image_ref = self
+            .resolve_image(sink, runtime.as_ref(), workspace_id, host_workspace, &parsed)
+            .await?;
+        let spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
 
         info!(
             workspace = workspace_id,
@@ -320,16 +474,6 @@ impl LifecycleOrchestrator {
             image = %spec.image.repository,
             "lifecycle.up starting"
         );
-
-        sink.status(workspace_id, "pulling", None, Some(&spec.image.repository), None);
-        sink.log(
-            workspace_id,
-            LogStreamKind::System,
-            &format!("pulling image {}", spec.image.repository),
-        );
-        debug!(workspace = workspace_id, "stage=pull begin");
-        stage("pull", runtime.pull(&spec.image).await)?;
-        debug!(workspace = workspace_id, "stage=pull end");
 
         sink.status(workspace_id, "creating", None, Some(&spec.image.repository), None);
         sink.log(
@@ -748,18 +892,24 @@ mod tests {
     #[derive(Default)]
     struct FakeScript {
         pull_err: Option<String>,
+        build_err: Option<String>,
         create_err: Option<String>,
         start_err: Option<String>,
+        /// Lines emitted on the build log channel before the build
+        /// returns. Each is sent as `(stream, line)`.
+        build_log: Vec<(LogStreamKind, String)>,
     }
 
     struct FakeRuntime {
         script: PlMutex<FakeScript>,
+        build_calls: PlMutex<Vec<crate::container::BuildSpec>>,
     }
 
     impl FakeRuntime {
         fn new(script: FakeScript) -> Self {
             Self {
                 script: PlMutex::new(script),
+                build_calls: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -781,6 +931,26 @@ mod tests {
                 return Err(ContainerRuntimeError::Backend(e));
             }
             Ok(())
+        }
+        async fn build(
+            &self,
+            spec: &crate::container::BuildSpec,
+            log_sink: Option<tokio::sync::mpsc::Sender<LogChunk>>,
+        ) -> Result<ImageRef, ContainerRuntimeError> {
+            self.build_calls.lock().push(spec.clone());
+            // Drain any scripted log lines into the sink, mirroring how
+            // the real backend forwards `container build` output.
+            let lines: Vec<(LogStreamKind, String)> =
+                std::mem::take(&mut self.script.lock().build_log);
+            if let Some(tx) = log_sink {
+                for (stream, line) in lines {
+                    let _ = tx.send(LogChunk { stream, line }).await;
+                }
+            }
+            if let Some(e) = self.script.lock().build_err.take() {
+                return Err(ContainerRuntimeError::Backend(e));
+            }
+            Ok(spec.tag.clone())
         }
         async fn create(
             &self,
@@ -977,32 +1147,111 @@ mod tests {
         );
     }
 
-    // -------- unsupported config: build/dockerfile is rejected explicitly --------
+    // -------- build path: dockerfile-based config invokes runtime.build --------
 
     #[tokio::test]
-    async fn up_with_dockerfile_build_reports_unsupported_error() {
+    async fn up_with_dockerfile_build_invokes_runtime_build_and_emits_building_status() {
         let o = LifecycleOrchestrator::new();
         let parsed = ParsedDevContainer {
             name: Some("JupyterLite Demo".into()),
-            build: Some(serde_json::json!({"dockerfile": "Dockerfile"})),
+            build: Some(DevContainerBuild {
+                dockerfile: Some("Dockerfile".into()),
+                context: Some("..".into()),
+                ..Default::default()
+            }),
+            config_file_path: Some(PathBuf::from(
+                "/tmp/take-two/.devcontainer/devcontainer.json",
+            )),
             ..Default::default()
         };
         o.set_parsed_config("ws", parsed);
-        let registry = registry_with(FakeRuntime::new(FakeScript::default()));
+
+        let runtime = Arc::new(FakeRuntime::new(FakeScript {
+            build_log: vec![
+                (LogStreamKind::Stdout, "step 1/2: FROM python:3.13".into()),
+                (LogStreamKind::Stdout, "step 2/2: RUN apt-get update".into()),
+            ],
+            ..Default::default()
+        }));
+        let registry = RuntimeRegistry::with_single(
+            RuntimeId::AppleContainers,
+            runtime.clone() as Arc<dyn ContainerRuntime>,
+        );
+        let sink = CapturingSink::default();
+
+        let status = o
+            .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/take-two"))
+            .await
+            .expect("up should succeed for build-based config");
+        assert_eq!(status.state, "running");
+
+        // The build was invoked with the right resolved paths.
+        let calls = runtime.build_calls.lock().clone();
+        assert_eq!(calls.len(), 1, "expected one build call");
+        let bs = &calls[0];
+        assert_eq!(
+            bs.dockerfile,
+            PathBuf::from("/tmp/take-two/.devcontainer/Dockerfile"),
+            "dockerfile resolved relative to .devcontainer/"
+        );
+        assert_eq!(
+            bs.context_dir,
+            PathBuf::from("/tmp/take-two/.devcontainer/.."),
+            "context resolved relative to .devcontainer/"
+        );
+        assert!(
+            bs.tag.repository.starts_with("devcontainer-take-two"),
+            "synthesised tag should be workspace-scoped, got: {}",
+            bs.tag.repository
+        );
+
+        // Status sequence includes `building` (not `pulling`).
+        let states: Vec<String> = sink
+            .statuses
+            .lock()
+            .iter()
+            .map(|s| s.state.clone())
+            .collect();
+        assert_eq!(states, vec!["building", "creating", "created", "running"]);
+
+        // Build log lines surfaced to the dashboard.
+        let log_lines: Vec<String> =
+            sink.logs.lock().iter().map(|l| l.line.clone()).collect();
+        assert!(
+            log_lines.iter().any(|l| l.contains("step 1/2: FROM python")),
+            "expected build stdout in sink; got: {log_lines:?}"
+        );
+    }
+
+    // -------- failure mode: build fails -> error status with stderr surfaces --------
+
+    #[tokio::test]
+    async fn up_with_build_failure_surfaces_error_status_and_log() {
+        let o = LifecycleOrchestrator::new();
+        let parsed = ParsedDevContainer {
+            build: Some(DevContainerBuild::default()),
+            config_file_path: Some(PathBuf::from(
+                "/tmp/ws/.devcontainer/devcontainer.json",
+            )),
+            ..Default::default()
+        };
+        o.set_parsed_config("ws", parsed);
+
+        let registry = registry_with(FakeRuntime::new(FakeScript {
+            build_err: Some("Dockerfile syntax error on line 3".into()),
+            ..Default::default()
+        }));
         let sink = CapturingSink::default();
 
         let err = o
             .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
             .await
-            .expect_err("build-based config must be rejected");
+            .expect_err("build error must propagate");
         let msg = err.to_string();
         assert!(
-            msg.contains("build") && msg.contains("not yet implemented"),
-            "expected an unsupported-build error, got: {msg}"
+            msg.contains("build failed") && msg.contains("Dockerfile syntax error"),
+            "expected detailed build error, got: {msg}"
         );
-
-        // The error should also surface to the UI (status pill + log line)
-        // so the user does not see a silent default-image fallback.
         let states: Vec<String> = sink
             .statuses
             .lock()
@@ -1012,6 +1261,30 @@ mod tests {
         assert!(
             states.contains(&"error".to_string()),
             "expected error status; got: {states:?}"
+        );
+    }
+
+    // -------- compose is still rejected explicitly (one-container-per-repo) --------
+
+    #[tokio::test]
+    async fn up_with_compose_config_reports_unsupported_error() {
+        let o = LifecycleOrchestrator::new();
+        let parsed = ParsedDevContainer {
+            docker_compose_file: Some(serde_json::json!("docker-compose.yml")),
+            ..Default::default()
+        };
+        o.set_parsed_config("ws", parsed);
+        let registry = registry_with(FakeRuntime::new(FakeScript::default()));
+        let sink = CapturingSink::default();
+
+        let err = o
+            .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .await
+            .expect_err("compose config must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dockerComposeFile") && msg.contains("one-container-per-repo"),
+            "expected compose-rejection error, got: {msg}"
         );
     }
 }

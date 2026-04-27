@@ -33,26 +33,59 @@ impl LifecycleCommand {
     }
 }
 
-/// Subset of the parsed `devcontainer.json` fields needed by the v1 MVP.
-/// This is the contract sent from the WebView to the Rust host. Fields
-/// outside this struct (Features, compose, etc.) are deferred to later
-/// phases.
+/// Dockerfile-based build. Mirrors the upstream
+/// `DevContainerFromDockerfileConfig.build` object. Paths are *not*
+/// resolved here — they are interpreted relative to
+/// [`ParsedDevContainer::config_file_path`]'s parent (the
+/// `.devcontainer/` folder), per the upstream spec.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevContainerBuild {
+    /// Dockerfile path relative to the `.devcontainer/` folder. Defaults
+    /// to `Dockerfile` when omitted, matching the spec.
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// Build context directory relative to the `.devcontainer/` folder.
+    /// Defaults to `.` (the `.devcontainer/` folder itself).
+    #[serde(default)]
+    pub context: Option<String>,
+    /// `--build-arg` values.
+    #[serde(default)]
+    pub args: std::collections::HashMap<String, String>,
+    /// Multi-stage build target.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Image tag(s) the upstream spec asks the build to be tagged with.
+    /// We honour these when set; otherwise we synthesise a workspace-
+    /// scoped tag.
+    #[serde(default)]
+    pub cache_from: Vec<String>,
+}
+
+/// Subset of the parsed `devcontainer.json` fields the v1 host consumes.
+/// This is the contract sent from the WebView to the Rust host.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParsedDevContainer {
     #[serde(default)]
     pub name: Option<String>,
+    /// Pre-built image reference. Mutually exclusive with `build` per
+    /// the spec; if both are set, `build` wins (matches upstream).
     #[serde(default)]
     pub image: Option<String>,
-    /// Raw `build` object (Dockerfile-based config). Carried through so
-    /// the host can detect-and-reject; the v1 lifecycle does not yet
-    /// build images.
+    /// Dockerfile-based build config. When set, the host will run
+    /// `runtime.build(...)` to produce the image before creating the
+    /// container.
     #[serde(default)]
-    pub build: Option<serde_json::Value>,
-    /// Raw `dockerComposeFile` value (string or array). Carried through
-    /// for the same reason as `build`.
+    pub build: Option<DevContainerBuild>,
+    /// Carried through so the host can surface a clear error. v1 does
+    /// not implement compose orchestration (one-container-per-repo).
     #[serde(default, rename = "dockerComposeFile")]
     pub docker_compose_file: Option<serde_json::Value>,
+    /// Absolute path to the `devcontainer.json` that produced this
+    /// struct. Used to resolve build paths relative to its parent.
+    #[serde(default)]
+    pub config_file_path: Option<PathBuf>,
     #[serde(default)]
     pub workspace_folder: Option<PathBuf>,
     #[serde(default)]
@@ -79,30 +112,15 @@ pub struct ParsedDevContainer {
     pub post_attach_command: Option<LifecycleCommand>,
 }
 
-/// Translate the parsed config into a runtime-agnostic [`ContainerSpec`].
-/// This is the minimal v1 implementation; later phases enrich it.
+/// Translate the parsed config into a runtime-agnostic [`ContainerSpec`],
+/// given the already-resolved [`ImageRef`] (the lifecycle decides whether
+/// it came from `pull` or `build`).
 pub fn to_container_spec(
     parsed: &ParsedDevContainer,
+    image_ref: ImageRef,
     workspace_id: &str,
     host_workspace: &std::path::Path,
 ) -> ContainerSpec {
-    let image_ref = parsed
-        .image
-        .as_deref()
-        .map(parse_image_ref)
-        .unwrap_or_else(|| {
-            // Caller is expected to validate via the lifecycle layer;
-            // this fallback only kicks in for old/incomplete callers
-            // (e.g. tests) and is intentionally obvious so it surfaces
-            // in logs rather than silently running a stand-in image.
-            ImageRef {
-                registry: None,
-                repository: "devcontainer-image-unspecified".to_string(),
-                tag: None,
-                digest: None,
-            }
-        });
-
     let workspace_target = parsed.workspace_folder.clone().unwrap_or_else(|| {
         PathBuf::from("/workspaces").join(
             host_workspace
@@ -196,7 +214,7 @@ fn sanitize_entity_name(input: &str) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-fn parse_image_ref(s: &str) -> ImageRef {
+pub fn parse_image_ref(s: &str) -> ImageRef {
     // Minimal parser: registry/repo:tag@digest. Sufficient for v1.
     let (rest, digest) = match s.split_once('@') {
         Some((r, d)) => (r, Some(d.to_string())),
@@ -265,7 +283,12 @@ mod tests {
             image: Some("ubuntu:24.04".into()),
             ..Default::default()
         };
-        let spec = to_container_spec(&parsed, "ws-1", std::path::Path::new("/tmp/take-two"));
+        let spec = to_container_spec(
+            &parsed,
+            parse_image_ref("ubuntu:24.04"),
+            "ws-1",
+            std::path::Path::new("/tmp/take-two"),
+        );
         assert_eq!(spec.name, "JupyterLite-Demo");
     }
 

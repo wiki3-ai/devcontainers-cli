@@ -82,6 +82,23 @@ pub struct ContainerSpec {
     pub privileged: bool,
 }
 
+/// Runtime-agnostic input for [`ContainerRuntime::build`]. The
+/// lifecycle orchestrator translates the parsed `devcontainer.json`
+/// build stanza into this shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildSpec {
+    /// Tag to apply to the resulting image.
+    pub tag: ImageRef,
+    /// Absolute path to the build context directory.
+    pub context_dir: PathBuf,
+    /// Absolute path to the Dockerfile.
+    pub dockerfile: PathBuf,
+    /// `--build-arg` key/value pairs.
+    pub build_args: HashMap<String, String>,
+    /// Multi-stage build target.
+    pub target: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerStatus {
     pub container_id: String,
@@ -161,6 +178,22 @@ pub trait ContainerRuntime: Send + Sync {
     async fn probe(&self) -> Result<RuntimeAvailability, ContainerRuntimeError>;
 
     async fn pull(&self, image: &ImageRef) -> Result<(), ContainerRuntimeError>;
+    /// Build an image from a Dockerfile. Backends that do not support
+    /// building must return [`ContainerRuntimeError::Unsupported`]. The
+    /// optional `log_sink` receives stdout/stderr lines as the build
+    /// progresses; the same channel pattern as [`Self::logs`] applies
+    /// (closing the receiver tells the backend to abort).
+    async fn build(
+        &self,
+        spec: &BuildSpec,
+        log_sink: Option<mpsc::Sender<LogChunk>>,
+    ) -> Result<ImageRef, ContainerRuntimeError> {
+        let _ = (spec, log_sink);
+        Err(ContainerRuntimeError::Unsupported(format!(
+            "{:?} backend does not support building images",
+            self.id()
+        )))
+    }
     async fn create(&self, spec: &ContainerSpec) -> Result<String, ContainerRuntimeError>;
     async fn start(&self, container_id: &str) -> Result<(), ContainerRuntimeError>;
     async fn stop(&self, container_id: &str) -> Result<(), ContainerRuntimeError>;

@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::traits::{
-    ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus,
-    ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream, LogStreamKind, MountKind,
-    RuntimeAvailability, RuntimeId,
+    BuildSpec, ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState,
+    ContainerStatus, ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream,
+    LogStreamKind, MountKind, RuntimeAvailability, RuntimeId,
 };
 
 mod cli;
@@ -96,6 +96,114 @@ impl ContainerRuntime for AppleContainersRuntime {
         let args = cli::pull_args(image);
         run_capturing(&self.cli, args.iter().map(String::as_str)).await?;
         Ok(())
+    }
+
+    /// Build an image via `container build`. Streams stdout/stderr lines
+    /// to `log_sink` as they arrive so the dashboard can show progress in
+    /// real time, then returns the resulting [`ImageRef`] (== `spec.tag`).
+    async fn build(
+        &self,
+        spec: &BuildSpec,
+        log_sink: Option<mpsc::Sender<LogChunk>>,
+    ) -> Result<ImageRef, ContainerRuntimeError> {
+        let args = cli::build_args(spec);
+        let mut cmd = self.cli.command();
+        for a in &args {
+            cmd.arg(a);
+        }
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        debug!(
+            binary = self.cli.binary(),
+            argv = ?args,
+            "running container build"
+        );
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ContainerRuntimeError::Backend(format!("spawn `container build`: {e}")))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ContainerRuntimeError::Backend("no stdout from `container build`".into())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ContainerRuntimeError::Backend("no stderr from `container build`".into())
+        })?;
+
+        // Pump output to the optional sink. Even when no sink is wired up
+        // we still need to drain the pipes so the child does not block on
+        // a full buffer; we collect stderr into a String so we can include
+        // it in the error on failure.
+        let stderr_buf: std::sync::Arc<parking_lot::Mutex<String>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+
+        let stdout_sink = log_sink.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(tx) = &stdout_sink {
+                    if tx
+                        .send(LogChunk {
+                            stream: LogStreamKind::Stdout,
+                            line,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let stderr_sink = log_sink.clone();
+        let stderr_buf2 = stderr_buf.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                {
+                    let mut buf = stderr_buf2.lock();
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                if let Some(tx) = &stderr_sink {
+                    if tx
+                        .send(LogChunk {
+                            stream: LogStreamKind::Stderr,
+                            line,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| ContainerRuntimeError::Backend(format!("wait `container build`: {e}")))?;
+
+        if !status.success() {
+            let stderr = stderr_buf.lock().clone();
+            warn!(
+                binary = self.cli.binary(),
+                argv = ?args,
+                %status,
+                stderr = %stderr.trim(),
+                "container build exited non-zero",
+            );
+            return Err(ContainerRuntimeError::Backend(format!(
+                "`{} {}` exited with {status}: {}",
+                self.cli.binary(),
+                args.join(" "),
+                stderr.trim()
+            )));
+        }
+        Ok(spec.tag.clone())
     }
 
     async fn create(&self, spec: &ContainerSpec) -> Result<String, ContainerRuntimeError> {

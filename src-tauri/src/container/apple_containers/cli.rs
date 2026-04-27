@@ -6,7 +6,8 @@
 use tokio::process::Command;
 
 use crate::container::traits::{
-    ContainerRuntimeError, ContainerSpec, ContainerStatus, ExecOptions, ImageRef, LogOptions,
+    BuildSpec, ContainerRuntimeError, ContainerSpec, ContainerStatus, ExecOptions, ImageRef,
+    LogOptions,
 };
 
 use super::{mount_flag, InspectShape};
@@ -64,6 +65,31 @@ pub(crate) fn pull_args(image: &ImageRef) -> Vec<String> {
         "pull".to_string(),
         image_ref_to_string(image),
     ]
+}
+
+/// Argv for `container build --tag <ref> --file <dockerfile> [--build-arg k=v]... [--target T] <context>`.
+/// Apple's `container` CLI mirrors Docker/Podman's flags here. Build
+/// args are sorted so the argv is deterministic for tests.
+pub(crate) fn build_args(spec: &BuildSpec) -> Vec<String> {
+    let mut a = vec![
+        "build".to_string(),
+        "--tag".to_string(),
+        image_ref_to_string(&spec.tag),
+        "--file".to_string(),
+        spec.dockerfile.display().to_string(),
+    ];
+    let mut args: Vec<(&String, &String)> = spec.build_args.iter().collect();
+    args.sort_by(|x, y| x.0.cmp(y.0));
+    for (k, v) in args {
+        a.push("--build-arg".to_string());
+        a.push(format!("{k}={v}"));
+    }
+    if let Some(target) = &spec.target {
+        a.push("--target".to_string());
+        a.push(target.clone());
+    }
+    a.push(spec.context_dir.display().to_string());
+    a
 }
 
 pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<String> {
