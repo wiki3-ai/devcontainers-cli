@@ -437,6 +437,17 @@ pub(crate) struct InspectConfiguration {
     pub id: Option<String>,
     #[serde(default)]
     pub image: Option<InspectImage>,
+    /// Bind/volume mounts attached to the container. We only consume the
+    /// `source` (host-side path) for repo linkage; the rest is ignored.
+    #[serde(default)]
+    pub mounts: Vec<InspectMount>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InspectMount {
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,9 +473,9 @@ impl InspectShape {
             Some(ref s) if s == "created" => ContainerState::Created,
             _ => ContainerState::Unknown,
         };
-        let (cfg_id, cfg_image) = match self.configuration {
-            Some(c) => (c.id, c.image),
-            None => (None, None),
+        let (cfg_id, cfg_image, cfg_mounts) = match self.configuration {
+            Some(c) => (c.id, c.image, c.mounts),
+            None => (None, None, Vec::new()),
         };
         let container_id = cfg_id
             .or(self.id)
@@ -473,10 +484,15 @@ impl InspectShape {
         let image_ref = cfg_image
             .or(self.image)
             .and_then(|i| i.reference.or(i.name));
+        let host_mounts = cfg_mounts
+            .into_iter()
+            .filter_map(|m| m.source.filter(|s| !s.is_empty()))
+            .collect();
         ContainerStatus {
             container_id,
             state,
             image_ref,
+            host_mounts,
         }
     }
 }

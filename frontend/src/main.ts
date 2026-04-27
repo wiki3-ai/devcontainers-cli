@@ -279,11 +279,22 @@ function renderSidebar(): HTMLElement {
 	}
 
 	// --- Containers ----------------------------------------------------
-	const linkedCids = new Set(
-		Object.values(state.statuses)
-			.map((s) => s?.containerId)
-			.filter((cid): cid is string => !!cid),
-	);
+	// Two ways a container can be linked to a repo:
+	//   1. The lifecycle orchestrator recorded its container id in the
+	//      slot for that repo (most common; fast path).
+	//   2. The container has a bind-mount whose source matches a known
+	//      workspace path. This catches containers created in a previous
+	//      app run and survives slot resets after a hook failure.
+	const linkedCids = new Set<string>();
+	for (const s of Object.values(state.statuses)) {
+		if (s?.containerId) linkedCids.add(s.containerId);
+	}
+	const repoPaths = new Set(state.workspaces.map((w) => w.path));
+	for (const c of state.containers) {
+		if (c.hostMounts.some((p) => repoPaths.has(p))) {
+			linkedCids.add(c.containerId);
+		}
+	}
 	const systemContainers = state.containers.filter(isSystemContainer);
 	const userContainers = state.containers.filter((c) => !isSystemContainer(c));
 
@@ -388,18 +399,44 @@ function renderContainerItem(c: ContainerEntry, linked: boolean): HTMLElement {
 	meta.textContent = c.imageRef ?? '';
 	const status = document.createElement('div');
 	status.className = `ws-status state-${c.state}`;
-	status.textContent = linked ? `${c.state} · linked` : c.state;
+	const linkedRepo = linked ? findLinkedRepo(c) : undefined;
+	const linkText = linkedRepo ? ` · ${linkedRepo.displayName}` : linked ? ' · linked' : '';
+	status.textContent = `${c.state}${linkText}`;
 	li.append(title, meta, status);
 	li.addEventListener('click', () => selectContainer(c.containerId));
 	return li;
 }
 
+/** Find the repo a container is bound to via either an orchestrator
+ *  slot or a matching bind-mount source. Returns the first match in
+ *  workspace order. */
+function findLinkedRepo(c: ContainerEntry): WorkspaceEntry | undefined {
+	for (const w of state.workspaces) {
+		if (state.statuses[w.id]?.containerId === c.containerId) return w;
+	}
+	for (const w of state.workspaces) {
+		if (c.hostMounts.includes(w.path)) return w;
+	}
+	return undefined;
+}
+
 function formatRepoStatus(workspaceId: string): string {
 	const s = state.statuses[workspaceId];
-	if (!s) return 'no container';
-	const parts: string[] = [s.state];
-	if (s.containerId) parts.push(s.containerId);
-	return parts.join(' · ');
+	if (s) {
+		const parts: string[] = [s.state];
+		if (s.containerId) parts.push(s.containerId);
+		return parts.join(' · ');
+	}
+	// No orchestrator slot yet (e.g. fresh app start). Look for a
+	// running container whose bind-mount source matches this repo's
+	// path and surface its state so the dashboard isn't misleadingly
+	// blank.
+	const ws = state.workspaces.find((w) => w.id === workspaceId);
+	if (ws) {
+		const match = state.containers.find((c) => c.hostMounts.includes(ws.path));
+		if (match) return `${match.state} · ${match.containerId}`;
+	}
+	return 'no container';
 }
 
 function renderDetail(): HTMLElement {

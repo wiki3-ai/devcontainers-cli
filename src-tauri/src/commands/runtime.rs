@@ -44,6 +44,10 @@ pub struct ContainerEntry {
     pub container_id: String,
     pub state: String,
     pub image_ref: Option<String>,
+    /// Host-side bind-mount sources, used by the dashboard to link a
+    /// container back to a known repo without relying on container
+    /// names.
+    pub host_mounts: Vec<String>,
 }
 
 /// List all containers known to the selected runtime, regardless of
@@ -62,6 +66,7 @@ pub async fn list_containers(
             container_id: s.container_id,
             state: state_str(s.state).to_string(),
             image_ref: s.image_ref,
+            host_mounts: s.host_mounts,
         })
         .collect())
 }

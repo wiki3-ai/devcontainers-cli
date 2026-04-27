@@ -1094,6 +1094,7 @@ mod tests {
                 container_id: container_id.into(),
                 state: crate::container::ContainerState::Running,
                 image_ref: None,
+                host_mounts: Vec::new(),
             })
         }
         async fn list(&self) -> Result<Vec<ContainerStatus>, ContainerRuntimeError> {

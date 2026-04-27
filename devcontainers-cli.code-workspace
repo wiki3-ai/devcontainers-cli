@@ -4,10 +4,10 @@
 			"path": "."
 		},
 		{
-			"path": "../../Wiki3/take-two"
+			"path": "../wiki3-app"
 		},
 		{
-			"path": "../wiki3-app"
+			"path": "../../Wiki3"
 		}
 	]
 }

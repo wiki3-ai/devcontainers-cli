@@ -104,6 +104,12 @@ pub struct ContainerStatus {
     pub container_id: String,
     pub state: ContainerState,
     pub image_ref: Option<String>,
+    /// Host-side paths bind-mounted into the container, in the order the
+    /// runtime reported them. Used by the dashboard to link containers
+    /// back to known workspace folders without relying on a name
+    /// convention.
+    #[serde(default)]
+    pub host_mounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

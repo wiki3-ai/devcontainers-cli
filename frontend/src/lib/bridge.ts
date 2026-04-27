@@ -55,6 +55,10 @@ export interface ContainerEntry {
 	containerId: string;
 	state: 'created' | 'running' | 'stopped' | 'exited' | 'unknown';
 	imageRef?: string;
+	/** Host-side bind-mount sources reported by the runtime, used to
+	 *  link a container back to a known repo without relying on a
+	 *  matching name. */
+	hostMounts: string[];
 }
 
 /**

@@ -237,3 +237,32 @@ fn parse_list_reads_nested_configuration_id_and_image() {
         Some("ghcr.io/apple/container-builder-shim/builder:0.11.0")
     );
 }
+
+#[test]
+fn parse_inspect_extracts_host_mount_sources() {
+    // Trimmed copy of real `container inspect <name>` output. The
+    // dashboard joins `host_mounts[*]` against known workspace paths to
+    // render the repo↔container link without relying on the container
+    // having the same name as the repo folder.
+    let s = r#"[{
+        "configuration":{
+            "id":"JupyterLite-Demo",
+            "image":{"reference":"devcontainer-take-two:latest"},
+            "mounts":[
+                {"type":{"virtiofs":{}},"source":"/Users/jim/Wiki3/take-two","options":[],"destination":"/workspaces/take-two"}
+            ]
+        },
+        "status":"running"
+    }]"#;
+    let st = parse_inspect(s, "JupyterLite-Demo").unwrap();
+    assert_eq!(st.container_id, "JupyterLite-Demo");
+    assert_eq!(st.state, ContainerState::Running);
+    assert_eq!(st.host_mounts, vec!["/Users/jim/Wiki3/take-two".to_string()]);
+}
+
+#[test]
+fn parse_inspect_no_mounts_yields_empty_vec() {
+    let s = r#"{"id":"x","status":"running"}"#;
+    let st = parse_inspect(s, "x").unwrap();
+    assert!(st.host_mounts.is_empty());
+}
