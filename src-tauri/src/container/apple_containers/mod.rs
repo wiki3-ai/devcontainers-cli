@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::traits::{
     BuildSpec, ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState,
@@ -115,7 +115,7 @@ impl ContainerRuntime for AppleContainersRuntime {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        debug!(
+        info!(
             binary = self.cli.binary(),
             argv = ?args,
             "running container build"
@@ -257,6 +257,11 @@ impl ContainerRuntime for AppleContainersRuntime {
         options: &ExecOptions,
     ) -> Result<ExecResult, ContainerRuntimeError> {
         let args = cli::exec_args(container_id, options);
+        info!(
+            binary = self.cli.binary(),
+            argv = ?args,
+            "running container exec"
+        );
         let mut cmd = self.cli.command();
         for a in &args {
             cmd.arg(a);
@@ -266,8 +271,18 @@ impl ContainerRuntime for AppleContainersRuntime {
             .output()
             .await
             .map_err(|e| ContainerRuntimeError::Backend(format!("spawn `container exec`: {e}")))?;
+        let exit_code = output.status.code().unwrap_or(-1);
+        if exit_code != 0 {
+            warn!(
+                binary = self.cli.binary(),
+                argv = ?args,
+                exit_code,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "container exec exited non-zero",
+            );
+        }
         Ok(ExecResult {
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code,
             stdout: output.stdout,
             stderr: output.stderr,
         })

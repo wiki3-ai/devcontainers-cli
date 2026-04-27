@@ -1,16 +1,15 @@
 /*---------------------------------------------------------------------------------------------
  *  Devcontainers.app — dashboard entry point.
  *
- *  Step 8 of the conversion roadmap: minimal MVP UI with the dashboard,
- *  "Open Folder…" action, per-workspace detail panel (Up / Stop / Rebuild /
- *  Remove), and an xterm.js log pane subscribed to `devcontainer://log` and
- *  `devcontainer://status` events emitted by the Rust orchestrator.
+ *  Minimal MVP UI: dashboard, "Open Folder…" action, per-workspace detail
+ *  panel (Up / Stop / Rebuild / Remove), and a plain-text log pane
+ *  subscribed to `devcontainer://log` and `devcontainer://status` events
+ *  emitted by the Rust orchestrator. Logs are buffered per-workspace so
+ *  they survive re-renders and keep accumulating until the workspace is
+ *  removed from the dashboard.
  *--------------------------------------------------------------------------------------------*/
 
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import '@xterm/xterm/css/xterm.css';
 
 import {
 	bridge,
@@ -57,17 +56,25 @@ interface AppState {
 	runtimes: RuntimeInfo[];
 	selected?: string;
 	statuses: Record<string, ContainerStatus | undefined>;
+	/** Per-workspace log lines, in arrival order, capped at MAX_LOG_LINES. */
+	logs: Map<string, LogLine[]>;
 }
+
+interface LogLine {
+	stream: 'stdout' | 'stderr' | 'system';
+	line: string;
+	ts: number;
+}
+
+const MAX_LOG_LINES = 5000;
 
 const state: AppState = {
 	workspaces: [],
 	runtimes: [],
 	selected: undefined,
 	statuses: {},
+	logs: new Map(),
 };
-
-let terminal: Terminal | undefined;
-let fit: FitAddon | undefined;
 
 async function bootstrap(): Promise<void> {
 	const root = document.getElementById('app');
@@ -91,18 +98,59 @@ async function bootstrap(): Promise<void> {
 
 function subscribe(): void {
 	void bridge.onLifecycleLog((e) => {
-		if (e.workspaceId !== state.selected) {
-			return;
+		appendLog(e);
+		if (e.workspaceId === state.selected) {
+			appendLogToPane(e);
 		}
-		writeLog(e);
 	});
 	void bridge.onStatusChange((s) => {
 		state.statuses[s.workspaceId] = s;
-		const root = document.getElementById('app');
-		if (root) {
-			render(root);
-		}
+		updateStatusUi(s.workspaceId);
 	});
+}
+
+/** Append a log line to the per-workspace ring buffer (capped). */
+function appendLog(e: LifecycleLogEvent): void {
+	let buf = state.logs.get(e.workspaceId);
+	if (!buf) {
+		buf = [];
+		state.logs.set(e.workspaceId, buf);
+	}
+	buf.push({ stream: e.stream, line: e.line, ts: e.ts });
+	if (buf.length > MAX_LOG_LINES) {
+		buf.splice(0, buf.length - MAX_LOG_LINES);
+	}
+}
+
+/** Update only the bits of the UI that depend on a workspace's status,
+ *  without tearing down the log pane. */
+function updateStatusUi(workspaceId: string): void {
+	const s = state.statuses[workspaceId];
+	const sidebarStatus = document.querySelector<HTMLElement>(
+		`li[data-id="${cssEscape(workspaceId)}"] .ws-status`,
+	);
+	if (sidebarStatus) {
+		sidebarStatus.textContent = s?.state ?? 'absent';
+	}
+	if (workspaceId === state.selected) {
+		const statusLine = document.getElementById('status-line');
+		if (statusLine && s) {
+			statusLine.textContent = formatStatus(s);
+		} else if (statusLine) {
+			statusLine.textContent = 'absent';
+		}
+	}
+}
+
+function cssEscape(s: string): string {
+	return s.replace(/["\\]/g, '\\$&');
+}
+
+function formatStatus(s: ContainerStatus): string {
+	const parts: string[] = [s.state];
+	if (s.containerId) parts.push(s.containerId);
+	if (s.error) parts.push(`error: ${s.error}`);
+	return parts.join(' \u2014 ');
 }
 
 function render(root: HTMLElement): void {
@@ -213,46 +261,58 @@ function renderDetail(): HTMLElement {
 	const status = state.statuses[ws.id];
 	const statusLine = document.createElement('p');
 	statusLine.className = 'status-line';
-	statusLine.textContent = status
-		? `${status.state}${status.containerId ? ` — ${status.containerId}` : ''}${status.error ? ` (error: ${status.error})` : ''}`
-		: 'absent';
+	statusLine.id = 'status-line';
+	statusLine.textContent = status ? formatStatus(status) : 'absent';
 	main.appendChild(statusLine);
 
-	const term = document.createElement('div');
-	term.className = 'terminal';
-	term.id = 'terminal';
-	main.appendChild(term);
-
-	queueMicrotask(() => mountTerminal(term));
+	const pane = document.createElement('pre');
+	pane.className = 'log-pane';
+	pane.id = 'log-pane';
+	renderLogBuffer(pane, ws.id);
+	main.appendChild(pane);
 	return main;
 }
 
-function mountTerminal(host: HTMLElement): void {
-	terminal?.dispose();
-	terminal = new Terminal({
-		convertEol: true,
-		fontFamily: 'Menlo, Consolas, monospace',
-		fontSize: 12,
-		theme: { background: '#1e1e1e' },
+/** Replay the buffered log lines for a workspace into the pane. */
+function renderLogBuffer(pane: HTMLElement, workspaceId: string): void {
+	pane.replaceChildren();
+	const buf = state.logs.get(workspaceId);
+	if (!buf || buf.length === 0) {
+		return;
+	}
+	const frag = document.createDocumentFragment();
+	for (const entry of buf) {
+		frag.appendChild(makeLogLineNode(entry));
+	}
+	pane.appendChild(frag);
+	// Defer to layout so the pane has its scroll height.
+	queueMicrotask(() => {
+		pane.scrollTop = pane.scrollHeight;
 	});
-	fit = new FitAddon();
-	terminal.loadAddon(fit);
-	terminal.open(host);
-	try {
-		fit.fit();
-	} catch {
-		// xterm is sensitive to host dimensions; ignore until the next layout.
+}
+
+/** Append a single log line to the visible pane (without re-rendering
+ *  the entire buffer). Auto-scrolls only if the user is at/near the
+ *  bottom, so they can scroll up to read without being yanked back. */
+function appendLogToPane(e: LifecycleLogEvent): void {
+	const pane = document.getElementById('log-pane');
+	if (!pane) return;
+	const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
+	pane.appendChild(makeLogLineNode({ stream: e.stream, line: e.line, ts: e.ts }));
+	// Trim DOM if we exceed the cap; cheaper than rebuilding the pane.
+	while (pane.childElementCount > MAX_LOG_LINES) {
+		pane.removeChild(pane.firstChild!);
+	}
+	if (nearBottom) {
+		pane.scrollTop = pane.scrollHeight;
 	}
 }
 
-function writeLog(e: LifecycleLogEvent): void {
-	if (!terminal) {
-		return;
-	}
-	const prefix =
-		e.stream === 'stderr' ? '\x1b[31m' : e.stream === 'system' ? '\x1b[36m' : '';
-	const reset = prefix ? '\x1b[0m' : '';
-	terminal.writeln(`${prefix}${e.line}${reset}`);
+function makeLogLineNode(entry: LogLine): HTMLElement {
+	const row = document.createElement('div');
+	row.className = `log-line log-${entry.stream}`;
+	row.textContent = entry.line;
+	return row;
 }
 
 function selectWorkspace(id: string): void {
@@ -295,12 +355,20 @@ async function loadConfigForWorkspace(id: string): Promise<void> {
 			ws.path,
 		);
 		if (!result) {
-			terminal?.writeln(
-				`\x1b[33mNo .devcontainer/devcontainer.json found in ${ws.path}\x1b[0m`,
-			);
+			logLocal(id, 'system', `No .devcontainer/devcontainer.json found in ${ws.path}`);
 		}
 	} catch (err) {
-		terminal?.writeln(`\x1b[31mFailed to load devcontainer.json: ${(err as Error).message}\x1b[0m`);
+		logLocal(id, 'stderr', `Failed to load devcontainer.json: ${(err as Error).message}`);
+	}
+}
+
+/** Synthesize a log entry from the frontend (no Tauri event involved).
+ *  Useful for surfacing errors that happen before/around lifecycle calls. */
+function logLocal(workspaceId: string, stream: LogLine['stream'], line: string): void {
+	const e: LifecycleLogEvent = { workspaceId, stream, line, ts: Date.now() };
+	appendLog(e);
+	if (workspaceId === state.selected) {
+		appendLogToPane(e);
 	}
 }
 
@@ -314,9 +382,7 @@ async function onOpenFolder(): Promise<void> {
 		state.workspaces.push(ws);
 		state.selected = ws.id;
 	} catch (err) {
-		terminal?.writeln(
-			`\x1b[31mFailed to add workspace: ${(err as Error).message}\x1b[0m`,
-		);
+		logLocal(picked, 'stderr', `Failed to add workspace: ${(err as Error).message}`);
 		state.statuses[picked] = {
 			workspaceId: picked,
 			state: 'error',
@@ -352,11 +418,13 @@ async function action(kind: LifecycleAction, workspaceId: string): Promise<void>
 			state: 'error',
 			error: (err as Error).message,
 		};
+		logLocal(workspaceId, 'stderr', `${kind} failed: ${(err as Error).message}`);
 	}
-	const root = document.getElementById('app');
-	if (root) {
-		render(root);
-	}
+	// Don't full-rerender (would tear down the log pane); the orchestrator
+	// already emits a `devcontainer://status` event that flows through
+	// updateStatusUi(). Touch the sidebar/status text directly here too
+	// so the UI doesn't flicker on the resolution of the action promise.
+	updateStatusUi(workspaceId);
 }
 
 void bootstrap();

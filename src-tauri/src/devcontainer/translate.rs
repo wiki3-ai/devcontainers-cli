@@ -186,7 +186,7 @@ pub fn to_container_spec(
 /// name`. We keep ASCII alphanumerics, dash and underscore; everything
 /// else collapses to a single dash. Returns `None` if nothing usable
 /// remains so the caller can fall back to a workspace-id based name.
-fn sanitize_entity_name(input: &str) -> Option<String> {
+pub(crate) fn sanitize_entity_name(input: &str) -> Option<String> {
     let mut out = String::with_capacity(input.len());
     let mut last_was_dash = false;
     for c in input.chars() {

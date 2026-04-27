@@ -93,10 +93,11 @@ pub enum LifecycleError {
         #[source]
         source: ContainerRuntimeError,
     },
-    #[error("hook {label} exited with {exit_code}")]
+    #[error("hook {label} exited with {exit_code}{stderr_suffix}", stderr_suffix = if stderr_tail.is_empty() { String::new() } else { format!(": {}", stderr_tail) })]
     Hook {
         label: &'static str,
         exit_code: i32,
+        stderr_tail: String,
     },
     #[error("unsupported devcontainer.json: {0}")]
     Unsupported(String),
@@ -356,8 +357,9 @@ impl LifecycleOrchestrator {
                     build_spec.dockerfile.display()
                 ),
             );
-            debug!(
+            info!(
                 workspace = workspace_id,
+                tag = %build_spec.tag.repository,
                 dockerfile = %build_spec.dockerfile.display(),
                 context = %build_spec.context_dir.display(),
                 "stage=build begin"
@@ -365,28 +367,21 @@ impl LifecycleOrchestrator {
 
             // Bounded channel so a slow consumer can't grow memory.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<LogChunk>(256);
-            // Spawn a forwarder that copies chunks to the sink as they
-            // arrive. We use AbortHandle so we can join cleanly.
-            let workspace = workspace_id.to_string();
-            let pump_sink: std::sync::Arc<parking_lot::Mutex<Vec<LogChunk>>> =
-                std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-            let pump_buf = pump_sink.clone();
-            let pump = tokio::spawn(async move {
-                let _ = workspace; // captured for tracing if we want it
-                while let Some(chunk) = rx.recv().await {
-                    pump_buf.lock().push(chunk);
-                }
-            });
 
-            let result = runtime.build(&build_spec, Some(tx)).await;
-            // Channel closes when `runtime.build` returns and drops its
-            // sender; pump task exits on its own.
-            let _ = pump.await;
-            for chunk in pump_sink.lock().drain(..) {
-                sink.log(workspace_id, chunk.stream, &chunk.line);
-            }
+            // Forward chunks to the sink *as they arrive* (don't buffer
+            // until the build completes — we want live progress in the
+            // dashboard log pane). We can't `tokio::spawn` the pump
+            // because `sink: &dyn EventSink` is not 'static, so we run
+            // it inline via `tokio::join!` on the same task.
+            let build_fut = runtime.build(&build_spec, Some(tx));
+            let pump_fut = async {
+                while let Some(chunk) = rx.recv().await {
+                    sink.log(workspace_id, chunk.stream, &chunk.line);
+                }
+            };
+            let (result, ()) = tokio::join!(build_fut, pump_fut);
             let image_ref = stage("build", result)?;
-            debug!(workspace = workspace_id, "stage=build end");
+            info!(workspace = workspace_id, image = %image_ref.repository, "stage=build done");
             Ok(image_ref)
         } else {
             let image_str = parsed
@@ -406,9 +401,9 @@ impl LifecycleOrchestrator {
                 LogStreamKind::System,
                 &format!("pulling image {}", image_ref.repository),
             );
-            debug!(workspace = workspace_id, "stage=pull begin");
+            info!(workspace = workspace_id, image = %image_ref.repository, "stage=pull begin");
             stage("pull", runtime.pull(&image_ref).await)?;
-            debug!(workspace = workspace_id, "stage=pull end");
+            info!(workspace = workspace_id, image = %image_ref.repository, "stage=pull done");
             Ok(image_ref)
         }
     }
@@ -482,7 +477,32 @@ impl LifecycleOrchestrator {
             &format!("creating container {}", spec.name),
         );
         debug!(workspace = workspace_id, "stage=create begin");
-        let container_id = stage("create", runtime.create(&spec).await)?;
+        let container_id = match runtime.create(&spec).await {
+            Ok(id) => id,
+            // Apple's `container` CLI returns: "failed to create container
+            // (cause: \"exists: \"container already exists: NAME\"\")".
+            // Other backends use varied phrasing for the same condition.
+            // We treat "already exists" as recoverable: adopt the existing
+            // container by its configured name and continue. The user can
+            // hit Rebuild for a fresh one.
+            Err(ContainerRuntimeError::Backend(msg)) if is_already_exists(&msg) => {
+                warn!(
+                    workspace = workspace_id,
+                    name = %spec.name,
+                    "container already exists; adopting by name"
+                );
+                sink.log(
+                    workspace_id,
+                    LogStreamKind::System,
+                    &format!(
+                        "container `{}` already exists; adopting it (use Rebuild for a fresh container)",
+                        spec.name
+                    ),
+                );
+                spec.name.clone()
+            }
+            Err(err) => return Err(stage::<()>("create", Err(err)).unwrap_err()),
+        };
         debug!(workspace = workspace_id, container = %container_id, "stage=create end");
 
         self.record_state(
@@ -612,16 +632,45 @@ impl LifecycleOrchestrator {
         let _guard = lock.lock().await;
 
         let runtime = registry.selected();
-        let cid = self
+        // Prefer the recorded id, but if we don't have one (e.g. the app
+        // was restarted, or `up` failed before recording it) fall back to
+        // the container name we *would have* used. This is what the
+        // Remove button needs to work after a partial/failed Up.
+        let target = self
             .slots
             .read()
             .get(workspace_id)
-            .and_then(|s| s.container_id.clone());
-        if let Some(cid) = cid {
+            .and_then(|s| s.container_id.clone())
+            .or_else(|| {
+                self.slots
+                    .read()
+                    .get(workspace_id)
+                    .and_then(|s| s.parsed.as_ref())
+                    .map(|p| derive_container_name(p, workspace_id))
+            });
+        if let Some(cid) = target {
             info!(workspace = workspace_id, container = %cid, "lifecycle.remove");
-            if let Err(err) = stage("remove", runtime.remove(&cid, true).await) {
-                self.report_failure(sink, workspace_id, "remove", &err);
-                return Err(err);
+            match runtime.remove(&cid, true).await {
+                Ok(()) => {}
+                // Treat "not found" as success — the desired end state
+                // (no container) is already true.
+                Err(ContainerRuntimeError::Backend(msg)) if is_not_found(&msg) => {
+                    info!(
+                        workspace = workspace_id,
+                        container = %cid,
+                        "remove: container not found; treating as success"
+                    );
+                    sink.log(
+                        workspace_id,
+                        LogStreamKind::System,
+                        &format!("container `{cid}` not found (already removed)"),
+                    );
+                }
+                Err(err) => {
+                    let lerr = stage::<()>("remove", Err(err)).unwrap_err();
+                    self.report_failure(sink, workspace_id, "remove", &lerr);
+                    return Err(lerr);
+                }
             }
             let mut map = self.slots.write();
             if let Some(slot) = map.get_mut(workspace_id) {
@@ -630,6 +679,10 @@ impl LifecycleOrchestrator {
                 slot.last_image_ref = None;
                 slot.last_error = None;
             }
+            sink.status(workspace_id, "absent", None, None, None);
+        } else {
+            debug!(workspace = workspace_id, "remove: no container or parsed config");
+            self.record_state(workspace_id, "absent", None, None);
             sink.status(workspace_id, "absent", None, None, None);
         }
         Ok(self.snapshot(workspace_id))
@@ -689,6 +742,34 @@ impl LifecycleOrchestrator {
     }
 }
 
+/// Detect a backend "container already exists" error message regardless
+/// of which CLI produced it. Apple `container` says
+/// `exists: "container already exists: NAME"`; Docker/Podman wording
+/// includes phrases like `is already in use` or `already exists`.
+fn is_already_exists(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("already exists") || m.contains("is already in use")
+}
+
+/// Detect a backend "no such container" message. Apple says
+/// `not found: NAME`; Docker says `No such container`.
+fn is_not_found(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("not found") || m.contains("no such container")
+}
+
+/// Re-derive the container name we *would have* used for `up`, so the
+/// Remove button can clean up after a failed/restarted Up that never
+/// got to record a container_id.
+fn derive_container_name(parsed: &ParsedDevContainer, workspace_id: &str) -> String {
+    use crate::devcontainer::translate::sanitize_entity_name;
+    let raw_name = parsed
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
+    sanitize_entity_name(&raw_name).unwrap_or_else(|| format!("devcontainer-{workspace_id}"))
+}
+
 async fn run_hook(
     sink: &dyn EventSink,
     runtime: &dyn ContainerRuntime,
@@ -721,26 +802,38 @@ async fn run_hook(
         tty: false,
     };
     let result = stage("hook", runtime.exec(container_id, &opts).await)?;
-    for line in String::from_utf8_lossy(&result.stdout).lines() {
+    let stdout_text = String::from_utf8_lossy(&result.stdout);
+    let stderr_text = String::from_utf8_lossy(&result.stderr);
+    for line in stdout_text.lines() {
         if !line.is_empty() {
             sink.log(workspace_id, LogStreamKind::Stdout, line);
         }
     }
-    for line in String::from_utf8_lossy(&result.stderr).lines() {
+    for line in stderr_text.lines() {
         if !line.is_empty() {
             sink.log(workspace_id, LogStreamKind::Stderr, line);
         }
     }
     if result.exit_code != 0 {
+        // Keep the tail of stderr so the user sees what failed without
+        // having to open the log pane. 1KiB is plenty for a one-line
+        // "command not found" / "No such file" diagnostic.
+        let mut tail = stderr_text.trim().to_string();
+        if tail.len() > 1024 {
+            let start = tail.len() - 1024;
+            tail = format!("…{}", &tail[start..]);
+        }
         warn!(
             workspace = workspace_id,
             hook = label,
             exit_code = result.exit_code,
+            stderr = %tail,
             "lifecycle hook exited non-zero"
         );
         return Err(LifecycleError::Hook {
             label,
             exit_code: result.exit_code,
+            stderr_tail: tail,
         });
     }
     Ok(())

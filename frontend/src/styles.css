@@ -152,12 +152,48 @@ ul.workspaces li.selected {
 	color: #888;
 }
 
-.terminal {
+.log-pane {
 	flex: 1;
 	min-height: 240px;
-	background: #1e1e1e;
+	margin: 0;
+		padding: 0.5rem 0.75rem;
+		overflow: auto;
+		overflow-wrap: anywhere;
+		white-space: pre-wrap;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+		font-size: 12px;
+		line-height: 1.45;
+		/* System palette: respects light/dark via color-scheme on :root. */
+		background: Canvas;
+		color: CanvasText;
+		border: 1px solid #8884;
 	border-radius: 6px;
-	padding: 0.5rem;
-	overflow: hidden;
+	user-select: text;
+		-webkit-user-select: text;
+	}
+	
+	.log-line {
+		white-space: pre-wrap;
+	}
+	
+	.log-stderr {
+		color: #c62828;
+	}
+	
+	@media (prefers-color-scheme: dark) {
+		.log-stderr {
+			color: #ff6b6b;
+		}
+	}
+	
+	.log-system {
+		color: #666;
+		font-style: italic;
+	}
+	
+	@media (prefers-color-scheme: dark) {
+		.log-system {
+			color: #aaa;
+		}
 }
 
