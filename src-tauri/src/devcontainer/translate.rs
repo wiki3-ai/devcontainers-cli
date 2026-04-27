@@ -1,7 +1,7 @@
 //! Translate a parsed `devcontainer.json` (received from the WebView spec
 //! engine) into a [`ContainerSpec`] suitable for any
-//! [`crate::container::ContainerRuntime`]. Implementation lands in step 7 of
-//! the conversion roadmap.
+//! [`crate::container::ContainerRuntime`]. Only the v1 subset of fields is
+//! consumed; later phases enrich it.
 
 use std::path::PathBuf;
 
@@ -9,21 +9,65 @@ use serde::{Deserialize, Serialize};
 
 use crate::container::{ContainerSpec, ImageRef};
 
+/// `devcontainer.json` lifecycle command: either a single string parsed by
+/// the shell or an explicit argv array. Mirrors the upstream schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LifecycleCommand {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl LifecycleCommand {
+    /// Render as the argv passed to `runtime.exec(...)`. Single strings are
+    /// run via `/bin/sh -c` so `&&`, redirects, etc. work; we deliberately
+    /// avoid `-lc` (login shell) so the hook does not pick up unrelated
+    /// profile scripts in the workspace image.
+    pub fn to_argv(&self) -> Vec<String> {
+        match self {
+            LifecycleCommand::Single(s) => {
+                vec!["/bin/sh".to_string(), "-c".to_string(), s.clone()]
+            }
+            LifecycleCommand::Multiple(parts) => parts.clone(),
+        }
+    }
+}
+
 /// Subset of the parsed `devcontainer.json` fields needed by the v1 MVP.
 /// This is the contract sent from the WebView to the Rust host. Fields
 /// outside this struct (Features, compose, etc.) are deferred to later
 /// phases.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ParsedDevContainer {
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub image: Option<String>,
+    #[serde(default)]
     pub workspace_folder: Option<PathBuf>,
+    #[serde(default)]
     pub workspace_mount: Option<String>,
+    #[serde(default)]
     pub mounts: Vec<String>,
+    #[serde(default)]
     pub forward_ports: Vec<u16>,
+    #[serde(default)]
     pub remote_user: Option<String>,
+    #[serde(default)]
     pub container_env: std::collections::HashMap<String, String>,
+    #[serde(default)]
     pub remote_env: std::collections::HashMap<String, Option<String>>,
+    #[serde(default)]
+    pub on_create_command: Option<LifecycleCommand>,
+    #[serde(default)]
+    pub update_content_command: Option<LifecycleCommand>,
+    #[serde(default)]
+    pub post_create_command: Option<LifecycleCommand>,
+    #[serde(default)]
+    pub post_start_command: Option<LifecycleCommand>,
+    #[serde(default)]
+    pub post_attach_command: Option<LifecycleCommand>,
 }
 
 /// Translate the parsed config into a runtime-agnostic [`ContainerSpec`].

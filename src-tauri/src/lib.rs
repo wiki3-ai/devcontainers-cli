@@ -28,10 +28,13 @@ pub fn run() {
 
     let host_state = host::HostState::load().unwrap_or_default();
     let runtime_registry = container::RuntimeRegistry::with_default_backends();
+    let orchestrator = devcontainer::lifecycle::LifecycleOrchestrator::new();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(host_state)
         .manage(runtime_registry)
+        .manage(orchestrator)
         .menu(host::menu::build_menu)
         .on_menu_event(host::menu::handle_menu_event)
         .invoke_handler(tauri::generate_handler![
@@ -40,6 +43,7 @@ pub fn run() {
             commands::workspace::remove_workspace,
             commands::runtime::list_runtimes,
             commands::runtime::select_runtime,
+            commands::lifecycle::submit_parsed_devcontainer,
             commands::lifecycle::container_status,
             commands::lifecycle::container_up,
             commands::lifecycle::container_stop,

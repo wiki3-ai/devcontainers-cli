@@ -21,17 +21,17 @@ issue body; the steps below are the unit of PR-by-PR delivery.
 
 ## Phase 1 (cont.) — MVP
 
-- [ ] **Step 5 — `apple_containers` impl**: `pull`, `create`, `start`, `exec`,
+- [x] **Step 5 — `apple_containers` impl**: `pull`, `create`, `start`, `exec`,
       `logs`, `stop`, `remove`. Behind feature flag `apple-containers-live`
       for tests that drive the real `container` CLI.
-- [ ] **Step 6 — FileHost bridge wired end-to-end**: WebView-side adapter
+- [x] **Step 6 — FileHost bridge wired end-to-end**: WebView-side adapter
       (`frontend/src/devcontainer-engine/index.ts`) calls Tauri commands
       that read a real `.devcontainer/devcontainer.json`; the spec slice
       returns a fully substituted config to Rust.
-- [ ] **Step 7 — Lifecycle orchestrator** in Rust: parsed config →
+- [x] **Step 7 — Lifecycle orchestrator** in Rust: parsed config →
       `ContainerSpec` → `ContainerRuntime`. Run lifecycle hooks via
       `portable-pty`, stream logs/events to the WebView.
-- [ ] **Step 8 — MVP UI**: dashboard, "Open folder", workspace detail with
+- [x] **Step 8 — MVP UI**: dashboard, "Open folder", workspace detail with
       Up/Stop/Rebuild/Terminal/Logs (xterm.js).
 
 ## Phase 1 cleanup

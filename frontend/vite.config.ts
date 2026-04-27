@@ -14,5 +14,12 @@ export default defineConfig({
 		outDir: 'dist',
 		emptyOutDir: true,
 		sourcemap: true,
+		rollupOptions: {
+			// `/devcontainer-engine.js` is the deno-built spec slice bundle
+			// served from `frontend/public/`. We mark it external so Rollup
+			// keeps the runtime URL intact and does not try to resolve and
+			// inline a module that depends on Node built-ins.
+			external: ['/devcontainer-engine.js'],
+		},
 	},
 });

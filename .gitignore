@@ -21,4 +21,6 @@ src/test/container-*/**/src/**/README.md
 /src-tauri/target/
 /frontend/dist/
 /frontend/node_modules/
+/frontend/public/devcontainer-engine.js
+/frontend/public/devcontainer-engine.js.map
 .deno/

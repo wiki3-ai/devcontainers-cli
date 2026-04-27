@@ -16,7 +16,16 @@ export interface WorkspaceEntry {
 	lastOpenedAt?: string;
 }
 
-export type ContainerState = 'absent' | 'created' | 'running' | 'stopped' | 'error';
+export type ContainerState =
+	| 'absent'
+	| 'pulling'
+	| 'creating'
+	| 'created'
+	| 'running'
+	| 'stopped'
+	| 'exited'
+	| 'unknown'
+	| 'error';
 
 export interface ContainerStatus {
 	workspaceId: string;
@@ -62,6 +71,10 @@ export const bridge = {
 	container_stop: (workspaceId: string) => invoke<ContainerStatus>('container_stop', { workspaceId }),
 	container_rebuild: (workspaceId: string) => invoke<ContainerStatus>('container_rebuild', { workspaceId }),
 	container_remove: (workspaceId: string) => invoke<ContainerStatus>('container_remove', { workspaceId }),
+
+	// --- parsed devcontainer.json ------------------------------------------
+	submit_parsed_devcontainer: (workspaceId: string, parsed: unknown) =>
+		invoke<void>('submit_parsed_devcontainer', { workspaceId, parsed }),
 
 	// --- FileHost bridge ----------------------------------------------------
 	fs_is_file: (path: string) => invoke<boolean>('fs_is_file', { path }),
