@@ -159,10 +159,7 @@ pub fn to_container_spec(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let raw_name = parsed
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
+    let raw_name = derive_name_from_path(host_workspace, workspace_id);
     let name = sanitize_entity_name(&raw_name)
         .unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
 
@@ -184,6 +181,37 @@ pub fn to_container_spec(
         user: parsed.remote_user.clone(),
         privileged: false,
     }
+}
+
+/// Derive a deterministic, repo-unique container name from the host
+/// workspace path. Format is `<basename>-<8-hex>` where the hex is a
+/// stable hash of the full absolute path. This guarantees:
+///
+/// * Two repos called `take-two` in different parent directories don't
+///   collide on the runtime's name index (the hash differs).
+/// * Re-running `up` on the same repo produces the same name, so the
+///   orchestrator's adopt-on-already-exists path can find it again.
+///
+/// The devcontainer.json `name` is intentionally ignored: it is
+/// free-form display text shared by every fork of a template.
+pub(crate) fn derive_name_from_path(
+    host_workspace: &std::path::Path,
+    workspace_id: &str,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let basename = host_workspace
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("devcontainer");
+    let mut h = DefaultHasher::new();
+    host_workspace.hash(&mut h);
+    // Mix the workspace id in too so two different host registrations of
+    // the same path get distinct containers (rare but possible).
+    workspace_id.hash(&mut h);
+    let suffix = format!("{:08x}", (h.finish() as u32));
+    format!("{basename}-{suffix}")
 }
 
 /// Coerce an arbitrary devcontainer `name` (which is free-form, e.g.
@@ -284,19 +312,50 @@ mod tests {
     }
 
     #[test]
-    fn to_container_spec_sanitizes_devcontainer_name() {
+    fn to_container_spec_derives_name_from_repo_path() {
+        // Free-form devcontainer.json `name` is intentionally ignored:
+        // it's display text shared by every fork of a template, so two
+        // repos with the same `name` would collide on the runtime's
+        // global container-name index. The container name is derived
+        // from the host repo path instead.
         let parsed = ParsedDevContainer {
             name: Some("JupyterLite Demo".into()),
             image: Some("ubuntu:24.04".into()),
             ..Default::default()
         };
-        let spec = to_container_spec(
+        let spec_a = to_container_spec(
             &parsed,
             parse_image_ref("ubuntu:24.04"),
             "ws-1",
             std::path::Path::new("/tmp/take-two"),
         );
-        assert_eq!(spec.name, "JupyterLite-Demo");
+        let spec_b = to_container_spec(
+            &parsed,
+            parse_image_ref("ubuntu:24.04"),
+            "ws-2",
+            std::path::Path::new("/tmp/new-from-temp"),
+        );
+        // Two different repos with the same devcontainer name must
+        // produce distinct container names.
+        assert_ne!(spec_a.name, spec_b.name);
+        assert!(
+            spec_a.name.starts_with("take-two-"),
+            "got {}",
+            spec_a.name
+        );
+        assert!(
+            spec_b.name.starts_with("new-from-temp-"),
+            "got {}",
+            spec_b.name
+        );
+        // Same path + workspace_id is deterministic so adoption works.
+        let again = to_container_spec(
+            &parsed,
+            parse_image_ref("ubuntu:24.04"),
+            "ws-1",
+            std::path::Path::new("/tmp/take-two"),
+        );
+        assert_eq!(spec_a.name, again.name);
     }
 
     #[test]

@@ -198,6 +198,10 @@ struct WorkspaceSlot {
     last_image_ref: Option<String>,
     last_state: Option<&'static str>,
     last_error: Option<String>,
+    /// Host path of the repo this slot represents. Recorded by `up` so
+    /// `remove` can re-derive the container name after an app restart
+    /// or when no `container_id` was ever recorded.
+    host_workspace: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -318,6 +322,15 @@ impl LifecycleOrchestrator {
     ) -> Result<LifecycleStatus, LifecycleError> {
         let lock = self.lock_for(workspace_id);
         let _guard = lock.lock().await;
+
+        // Record the host path so `remove` can re-derive the container
+        // name even if `up` fails before `container_id` is recorded.
+        {
+            let mut map = self.slots.write();
+            map.entry(workspace_id.to_string())
+                .or_default()
+                .host_workspace = Some(host_workspace.to_path_buf());
+        }
 
         let result = self
             .up_inner(sink, registry, workspace_id, host_workspace)
@@ -642,11 +655,10 @@ impl LifecycleOrchestrator {
             .get(workspace_id)
             .and_then(|s| s.container_id.clone())
             .or_else(|| {
-                self.slots
-                    .read()
-                    .get(workspace_id)
-                    .and_then(|s| s.parsed.as_ref())
-                    .map(|p| derive_container_name(p, workspace_id))
+                let map = self.slots.read();
+                let slot = map.get(workspace_id)?;
+                let host = slot.host_workspace.as_ref()?;
+                Some(derive_container_name(workspace_id, host))
             });
         if let Some(cid) = target {
             info!(workspace = workspace_id, container = %cid, "lifecycle.remove");
@@ -777,13 +789,10 @@ fn is_not_found(msg: &str) -> bool {
 /// Re-derive the container name we *would have* used for `up`, so the
 /// Remove button can clean up after a failed/restarted Up that never
 /// got to record a container_id.
-fn derive_container_name(parsed: &ParsedDevContainer, workspace_id: &str) -> String {
-    use crate::devcontainer::translate::sanitize_entity_name;
-    let raw_name = parsed
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
-    sanitize_entity_name(&raw_name).unwrap_or_else(|| format!("devcontainer-{workspace_id}"))
+fn derive_container_name(workspace_id: &str, host_workspace: &std::path::Path) -> String {
+    use crate::devcontainer::translate::{derive_name_from_path, sanitize_entity_name};
+    let raw = derive_name_from_path(host_workspace, workspace_id);
+    sanitize_entity_name(&raw).unwrap_or_else(|| format!("devcontainer-{workspace_id}"))
 }
 
 async fn run_hook(
