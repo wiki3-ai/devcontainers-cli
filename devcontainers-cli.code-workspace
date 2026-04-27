@@ -2,6 +2,12 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"path": "../wiki3-app"
+		},
+		{
+			"path": "../../Wiki3"
 		}
 	]
 }

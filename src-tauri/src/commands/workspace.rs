@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::host::{HostState, Workspace};
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceDto {
     pub id: String,
     pub path: String,

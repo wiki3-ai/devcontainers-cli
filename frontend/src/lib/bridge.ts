@@ -16,7 +16,16 @@ export interface WorkspaceEntry {
 	lastOpenedAt?: string;
 }
 
-export type ContainerState = 'absent' | 'created' | 'running' | 'stopped' | 'error';
+export type ContainerState =
+	| 'absent'
+	| 'pulling'
+	| 'creating'
+	| 'created'
+	| 'running'
+	| 'stopped'
+	| 'exited'
+	| 'unknown'
+	| 'error';
 
 export interface ContainerStatus {
 	workspaceId: string;
@@ -40,6 +49,18 @@ export interface LifecycleLogEvent {
 	ts: number;
 }
 
+/** A container as known to the runtime, irrespective of any workspace
+ *  link the dashboard maintains. */
+export interface ContainerEntry {
+	containerId: string;
+	state: 'created' | 'running' | 'stopped' | 'exited' | 'unknown';
+	imageRef?: string;
+	/** Host-side bind-mount sources reported by the runtime, used to
+	 *  link a container back to a known repo without relying on a
+	 *  matching name. */
+	hostMounts: string[];
+}
+
 /**
  * Strongly typed wrappers around `invoke`. Kept as an object so tests can
  * monkey-patch individual methods, and so the FileHost adapter in
@@ -55,13 +76,24 @@ export const bridge = {
 	// --- runtime ------------------------------------------------------------
 	list_runtimes: () => invoke<RuntimeInfo[]>('list_runtimes'),
 	select_runtime: (id: RuntimeInfo['id']) => invoke<void>('select_runtime', { id }),
+	list_containers: () => invoke<ContainerEntry[]>('list_containers'),
+	container_start_by_id: (containerId: string) =>
+		invoke<void>('container_start_by_id', { containerId }),
+	container_stop_by_id: (containerId: string) =>
+		invoke<void>('container_stop_by_id', { containerId }),
+	container_remove_by_id: (containerId: string, force = true) =>
+		invoke<void>('container_remove_by_id', { containerId, force }),
 
-	// --- container lifecycle ------------------------------------------------
+	// --- container lifecycle (workspace-scoped) ----------------------------
 	container_status: (workspaceId: string) => invoke<ContainerStatus>('container_status', { workspaceId }),
 	container_up: (workspaceId: string) => invoke<ContainerStatus>('container_up', { workspaceId }),
 	container_stop: (workspaceId: string) => invoke<ContainerStatus>('container_stop', { workspaceId }),
 	container_rebuild: (workspaceId: string) => invoke<ContainerStatus>('container_rebuild', { workspaceId }),
 	container_remove: (workspaceId: string) => invoke<ContainerStatus>('container_remove', { workspaceId }),
+
+	// --- parsed devcontainer.json ------------------------------------------
+	submit_parsed_devcontainer: (workspaceId: string, parsed: unknown) =>
+		invoke<void>('submit_parsed_devcontainer', { workspaceId, parsed }),
 
 	// --- FileHost bridge ----------------------------------------------------
 	fs_is_file: (path: string) => invoke<boolean>('fs_is_file', { path }),

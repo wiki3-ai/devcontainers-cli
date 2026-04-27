@@ -1,17 +1,19 @@
 //! Container lifecycle commands. Each one resolves the workspace, picks
-//! the selected runtime, and delegates to it. The actual lifecycle
-//! orchestration (devcontainer.json parsing, hook execution, log
-//! streaming) lands in step 7 of the conversion roadmap; for now these
-//! commands are wired through to the runtime trait so the IPC surface is
-//! complete and testable.
+//! the selected runtime, and delegates to the
+//! [`crate::devcontainer::lifecycle::LifecycleOrchestrator`].
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
-use crate::container::{ContainerState, RuntimeRegistry};
+use crate::container::RuntimeRegistry;
+use crate::devcontainer::lifecycle::{LifecycleOrchestrator, LifecycleStatus};
+use crate::devcontainer::translate::ParsedDevContainer;
 use crate::host::HostState;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContainerStatusDto {
     pub workspace_id: String,
     pub state: String,
@@ -20,91 +22,111 @@ pub struct ContainerStatusDto {
     pub error: Option<String>,
 }
 
-fn workspace_must_exist(state: &HostState, workspace_id: &str) -> Result<(), String> {
+impl From<LifecycleStatus> for ContainerStatusDto {
+    fn from(s: LifecycleStatus) -> Self {
+        Self {
+            workspace_id: s.workspace_id,
+            state: s.state.to_string(),
+            container_id: s.container_id,
+            image_ref: s.image_ref,
+            error: s.error,
+        }
+    }
+}
+
+fn resolve_workspace(state: &HostState, workspace_id: &str) -> Result<PathBuf, String> {
     let inner = state.inner.read();
-    if inner.workspaces.iter().any(|w| w.id == workspace_id) {
-        Ok(())
-    } else {
-        Err(format!("unknown workspace: {workspace_id}"))
-    }
+    inner
+        .workspaces
+        .iter()
+        .find(|w| w.id == workspace_id)
+        .map(|w| w.path.clone())
+        .ok_or_else(|| format!("unknown workspace: {workspace_id}"))
 }
 
-fn pending(workspace_id: &str, msg: &str) -> ContainerStatusDto {
-    ContainerStatusDto {
-        workspace_id: workspace_id.to_string(),
-        state: state_to_string(ContainerState::Unknown),
-        container_id: None,
-        image_ref: None,
-        error: Some(msg.to_string()),
-    }
-}
-
-fn state_to_string(s: ContainerState) -> String {
-    match s {
-        ContainerState::Created => "created",
-        ContainerState::Running => "running",
-        ContainerState::Stopped => "stopped",
-        ContainerState::Exited => "exited",
-        ContainerState::Unknown => "unknown",
-    }
-    .into()
+#[tauri::command]
+pub async fn submit_parsed_devcontainer(
+    state: State<'_, HostState>,
+    orchestrator: State<'_, LifecycleOrchestrator>,
+    workspace_id: String,
+    parsed: ParsedDevContainer,
+) -> Result<(), String> {
+    resolve_workspace(&state, &workspace_id)?;
+    orchestrator.set_parsed_config(&workspace_id, parsed);
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn container_status(
     state: State<'_, HostState>,
     _registry: State<'_, RuntimeRegistry>,
+    orchestrator: State<'_, LifecycleOrchestrator>,
     workspace_id: String,
 ) -> Result<ContainerStatusDto, String> {
-    workspace_must_exist(&state, &workspace_id)?;
-    Ok(pending(
-        &workspace_id,
-        "lifecycle orchestrator lands in step 7 of the roadmap",
-    ))
+    resolve_workspace(&state, &workspace_id)?;
+    Ok(orchestrator.snapshot(&workspace_id).into())
 }
 
 #[tauri::command]
 pub async fn container_up(
+    app: AppHandle,
     state: State<'_, HostState>,
-    _registry: State<'_, RuntimeRegistry>,
+    registry: State<'_, RuntimeRegistry>,
+    orchestrator: State<'_, LifecycleOrchestrator>,
     workspace_id: String,
 ) -> Result<ContainerStatusDto, String> {
-    workspace_must_exist(&state, &workspace_id)?;
-    Ok(pending(&workspace_id, "container_up not yet implemented"))
+    let path = resolve_workspace(&state, &workspace_id)?;
+    orchestrator
+        .up(&app, &registry, &workspace_id, &path)
+        .await
+        .map(ContainerStatusDto::from)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn container_stop(
+    app: AppHandle,
     state: State<'_, HostState>,
-    _registry: State<'_, RuntimeRegistry>,
+    registry: State<'_, RuntimeRegistry>,
+    orchestrator: State<'_, LifecycleOrchestrator>,
     workspace_id: String,
 ) -> Result<ContainerStatusDto, String> {
-    workspace_must_exist(&state, &workspace_id)?;
-    Ok(pending(&workspace_id, "container_stop not yet implemented"))
+    resolve_workspace(&state, &workspace_id)?;
+    orchestrator
+        .stop(&app, &registry, &workspace_id)
+        .await
+        .map(ContainerStatusDto::from)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn container_rebuild(
+    app: AppHandle,
     state: State<'_, HostState>,
-    _registry: State<'_, RuntimeRegistry>,
+    registry: State<'_, RuntimeRegistry>,
+    orchestrator: State<'_, LifecycleOrchestrator>,
     workspace_id: String,
 ) -> Result<ContainerStatusDto, String> {
-    workspace_must_exist(&state, &workspace_id)?;
-    Ok(pending(
-        &workspace_id,
-        "container_rebuild not yet implemented",
-    ))
+    let path = resolve_workspace(&state, &workspace_id)?;
+    orchestrator
+        .rebuild(&app, &registry, &workspace_id, &path)
+        .await
+        .map(ContainerStatusDto::from)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn container_remove(
+    app: AppHandle,
     state: State<'_, HostState>,
-    _registry: State<'_, RuntimeRegistry>,
+    registry: State<'_, RuntimeRegistry>,
+    orchestrator: State<'_, LifecycleOrchestrator>,
     workspace_id: String,
 ) -> Result<ContainerStatusDto, String> {
-    workspace_must_exist(&state, &workspace_id)?;
-    Ok(pending(
-        &workspace_id,
-        "container_remove not yet implemented",
-    ))
+    resolve_workspace(&state, &workspace_id)?;
+    orchestrator
+        .remove(&app, &registry, &workspace_id)
+        .await
+        .map(ContainerStatusDto::from)
+        .map_err(|e| e.to_string())
 }

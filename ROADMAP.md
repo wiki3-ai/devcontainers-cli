@@ -21,18 +21,32 @@ issue body; the steps below are the unit of PR-by-PR delivery.
 
 ## Phase 1 (cont.) — MVP
 
-- [ ] **Step 5 — `apple_containers` impl**: `pull`, `create`, `start`, `exec`,
+- [x] **Step 5 — `apple_containers` impl**: `pull`, `create`, `start`, `exec`,
       `logs`, `stop`, `remove`. Behind feature flag `apple-containers-live`
       for tests that drive the real `container` CLI.
-- [ ] **Step 6 — FileHost bridge wired end-to-end**: WebView-side adapter
+- [x] **Step 6 — FileHost bridge wired end-to-end**: WebView-side adapter
       (`frontend/src/devcontainer-engine/index.ts`) calls Tauri commands
       that read a real `.devcontainer/devcontainer.json`; the spec slice
       returns a fully substituted config to Rust.
-- [ ] **Step 7 — Lifecycle orchestrator** in Rust: parsed config →
+- [x] **Step 7 — Lifecycle orchestrator** in Rust: parsed config →
       `ContainerSpec` → `ContainerRuntime`. Run lifecycle hooks via
       `portable-pty`, stream logs/events to the WebView.
-- [ ] **Step 8 — MVP UI**: dashboard, "Open folder", workspace detail with
+- [x] **Step 8 — MVP UI**: dashboard, "Open folder", workspace detail with
       Up/Stop/Rebuild/Terminal/Logs (xterm.js).
+- [x] **Step 8b — `build:` support**: `ContainerRuntime::build()` plus an
+      Apple Containers impl that shells out to `container build`, streams
+      stdout/stderr into the dashboard log pane, and surfaces captured
+      stderr on failure. Lifecycle dispatches build-vs-pull and emits a
+      `building` status. Paths in `build.dockerfile` / `build.context`
+      resolve relative to `.devcontainer/`, matching the upstream spec.
+      Synthesized tag is `devcontainer-<workspace-slug>:latest`. See
+      [docs/devcontainer-config-support.md](docs/devcontainer-config-support.md).
+- [x] **Step 8c — `dockerComposeFile` policy**: explicitly rejected with
+      an actionable error. The app's container model is **one container
+      per workspace folder** (wikis, agents, databases, ML inference,
+      …); multi-container topologies are composed at the dashboard
+      level, not via Compose. This is a **product decision, not a
+      deferral** — Step 10's compose bullet is removed.
 
 ## Phase 1 cleanup
 
@@ -46,8 +60,7 @@ issue body; the steps below are the unit of PR-by-PR delivery.
 
 - [ ] **Step 10 — Features + templates**: replace the Node `tar`/OCI logic
       with Rust (`oci-distribution`, `tar`, `flate2`). Templates browser.
-      `dockerComposeFile` support (when Apple Containers' compose story is
-      settled, or via a Rust compose shim). Dotfiles bootstrap.
+      Dotfiles bootstrap.
 
 ## Phase 3 — Other backends and platforms
 
@@ -57,7 +70,6 @@ issue body; the steps below are the unit of PR-by-PR delivery.
 
 - Apple Containers programmatic API surface (Swift/C) — keep an eye out so
   `apple_containers.rs` can switch from CLI shelling to direct API calls.
-- Compose semantics in Apple Containers.
 - OCI auth parity with the upstream CLI for Features.
 - Sync cadence with `devcontainers/cli`; the spec slice's directory layout
   is intentionally close to upstream so periodic merges are cheap.

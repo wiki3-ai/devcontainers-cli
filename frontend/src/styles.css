@@ -5,15 +5,234 @@
 
 body {
 	margin: 0;
-	padding: 1.5rem;
+	padding: 0;
+}
+
+#app {
+	display: flex;
+	flex-direction: column;
+	min-height: 100vh;
+}
+
+.app-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 0.75rem 1.25rem;
+	border-bottom: 1px solid #8884;
+}
+
+.app-header h1 {
+	margin: 0;
+	font-size: 1.1rem;
 }
 
 ul.runtimes {
+	margin: 0;
+	padding: 0.4rem 1.25rem;
+	list-style: none;
 	color: #888;
-	font-size: 0.9rem;
+	font-size: 0.8rem;
+	border-bottom: 1px solid #8884;
+	display: flex;
+	gap: 1rem;
+}
+
+ul.runtimes li::before {
+	content: "● ";
+	color: #4a4;
+}
+
+.layout {
+	display: grid;
+	grid-template-columns: minmax(220px, 280px) 1fr;
+	flex: 1;
+	min-height: 0;
+}
+
+.sidebar {
+	border-right: 1px solid #8884;
+	overflow-y: auto;
+	padding: 0.5rem;
+}
+
+.sidebar p {
+	margin: 1rem 0.5rem;
+	color: #888;
+}
+
+.sidebar-section {
+	font-size: 0.7rem;
+	font-weight: 700;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: #888;
+	margin: 0.75rem 0.5rem 0.25rem;
+}
+
+.sidebar-empty {
+	margin: 0.25rem 0.5rem 0.5rem !important;
+	font-size: 0.8rem;
+	font-style: italic;
+}
+
+.state-running {
+	color: #4a4;
+}
+
+.state-stopped,
+.state-exited {
+	color: #c80;
+}
+
+.state-created {
+	color: #888;
+}
+
+.state-unknown {
+	color: #888;
+}
+ul.workspaces li.system-entry {
+	cursor: default;
+	opacity: 0.7;
+}
+
+ul.workspaces li.system-entry:hover {
+	background: transparent;
+}
+ul.workspaces {
+	list-style: none;
+	margin: 0;
+	padding: 0;
 }
 
 ul.workspaces li {
-	padding: 0.5rem 0;
-	border-bottom: 1px solid #ccc4;
+	padding: 0.5rem 0.75rem;
+	border-radius: 6px;
+	cursor: pointer;
 }
+
+ul.workspaces li:hover {
+	background: #8881;
+}
+
+ul.workspaces li.selected {
+	background: #2563eb22;
+}
+
+.ws-title {
+	font-weight: 600;
+}
+
+.ws-path {
+	font-size: 0.75rem;
+	color: #888;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.ws-status {
+	font-size: 0.75rem;
+	color: #4a4;
+	margin-top: 0.15rem;
+}
+
+.detail {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	padding: 1rem;
+}
+
+.detail-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	margin-bottom: 0.5rem;
+}
+
+.detail-header h2 {
+	margin: 0;
+	font-size: 1.05rem;
+}
+
+.actions {
+	display: flex;
+	gap: 0.5rem;
+}
+
+.actions button {
+	padding: 0.35rem 0.75rem;
+	border-radius: 6px;
+	border: 1px solid #8886;
+	background: transparent;
+	cursor: pointer;
+	font: inherit;
+}
+
+.actions button:hover {
+	background: #8881;
+}
+
+.app-header button {
+	padding: 0.35rem 0.85rem;
+	border-radius: 6px;
+	border: 1px solid #2563eb;
+	background: #2563eb;
+	color: white;
+	cursor: pointer;
+	font: inherit;
+}
+
+.status-line {
+	margin: 0 0 0.75rem 0;
+	font-size: 0.85rem;
+	color: #888;
+}
+
+.log-pane {
+	flex: 1;
+	min-height: 240px;
+	margin: 0;
+		padding: 0.5rem 0.75rem;
+		overflow: auto;
+		overflow-wrap: anywhere;
+		white-space: pre-wrap;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+		font-size: 12px;
+		line-height: 1.45;
+		/* System palette: respects light/dark via color-scheme on :root. */
+		background: Canvas;
+		color: CanvasText;
+		border: 1px solid #8884;
+	border-radius: 6px;
+	user-select: text;
+		-webkit-user-select: text;
+	}
+	
+	.log-line {
+		white-space: pre-wrap;
+	}
+	
+	.log-stderr {
+		color: #c62828;
+	}
+	
+	@media (prefers-color-scheme: dark) {
+		.log-stderr {
+			color: #ff6b6b;
+		}
+	}
+	
+	.log-system {
+		color: #666;
+		font-style: italic;
+	}
+	
+	@media (prefers-color-scheme: dark) {
+		.log-system {
+			color: #aaa;
+		}
+}
+

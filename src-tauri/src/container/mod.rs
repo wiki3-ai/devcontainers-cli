@@ -11,8 +11,9 @@ pub mod podman;
 pub mod traits;
 
 pub use traits::{
-    ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus,
-    ExecOptions, ExecResult, ImageRef, MountKind, MountSpec, PortForward, PortProtocol, RuntimeId,
+    BuildSpec, ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState,
+    ContainerStatus, ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream,
+    LogStreamKind, MountKind, MountSpec, PortForward, PortProtocol, RuntimeAvailability, RuntimeId,
 };
 
 use std::collections::HashMap;
@@ -67,5 +68,19 @@ impl RuntimeRegistry {
             .get(&id)
             .cloned()
             .expect("selected runtime must be registered")
+    }
+
+    /// Test helper: build a registry with exactly one backend, already
+    /// selected. Lets the lifecycle orchestrator be exercised end-to-end
+    /// against a fake `ContainerRuntime` without touching the real
+    /// Apple/Podman/Docker backends.
+    #[doc(hidden)]
+    pub fn with_single(id: RuntimeId, backend: Arc<dyn ContainerRuntime>) -> Self {
+        let mut backends: HashMap<RuntimeId, Arc<dyn ContainerRuntime>> = HashMap::new();
+        backends.insert(id, backend);
+        Self {
+            backends,
+            selected: RwLock::new(id),
+        }
     }
 }

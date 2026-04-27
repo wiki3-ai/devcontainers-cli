@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use super::traits::{
     ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerStatus, ExecOptions,
-    ExecResult, ImageRef, RuntimeAvailability, RuntimeId,
+    ExecResult, ImageRef, LogOptions, LogStream, RuntimeAvailability, RuntimeId,
 };
 
 #[derive(Debug, Default)]
@@ -53,6 +53,9 @@ impl ContainerRuntime for PodmanRuntime {
         Err(unsupported())
     }
     async fn exec(&self, _: &str, _: &ExecOptions) -> Result<ExecResult, ContainerRuntimeError> {
+        Err(unsupported())
+    }
+    async fn logs(&self, _: &str, _: &LogOptions) -> Result<LogStream, ContainerRuntimeError> {
         Err(unsupported())
     }
 }
