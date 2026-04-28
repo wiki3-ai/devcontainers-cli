@@ -333,7 +333,10 @@ async fn inspect_does_not_pass_format_flag() {
     let rt = AppleContainersRuntime::with_binary(script.display().to_string());
     rt.create(&spec("dev")).await.unwrap();
     rt.start("dev").await.unwrap();
-    let status = rt.inspect("dev").await.expect("inspect must not pass --format");
+    let status = rt
+        .inspect("dev")
+        .await
+        .expect("inspect must not pass --format");
     assert_eq!(status.state, ContainerState::Running);
 }
 

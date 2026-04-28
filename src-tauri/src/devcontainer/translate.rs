@@ -167,8 +167,8 @@ pub fn to_container_spec(
         .collect();
 
     let raw_name = derive_name_from_path(host_workspace, workspace_id);
-    let name = sanitize_entity_name(&raw_name)
-        .unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
+    let name =
+        sanitize_entity_name(&raw_name).unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
 
     ContainerSpec {
         name,
@@ -180,7 +180,11 @@ pub fn to_container_spec(
         // without a TTY) leave us with a "stopped" container the moment
         // `start` returns and `exec` then fails with "no sandbox
         // client exists: container is stopped".
-        command: Some(vec!["/bin/sh".into(), "-c".into(), "while sleep 2147483647; do :; done".into()]),
+        command: Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "while sleep 2147483647; do :; done".into(),
+        ]),
         workdir: Some(workspace_target),
         env,
         mounts,
@@ -254,7 +258,11 @@ pub(crate) fn sanitize_entity_name(input: &str) -> Option<String> {
     {
         out.remove(0);
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 pub fn parse_image_ref(s: &str) -> ImageRef {
@@ -346,11 +354,7 @@ mod tests {
         // Two different repos with the same devcontainer name must
         // produce distinct container names.
         assert_ne!(spec_a.name, spec_b.name);
-        assert!(
-            spec_a.name.starts_with("take-two-"),
-            "got {}",
-            spec_a.name
-        );
+        assert!(spec_a.name.starts_with("take-two-"), "got {}", spec_a.name);
         assert!(
             spec_b.name.starts_with("new-from-temp-"),
             "got {}",

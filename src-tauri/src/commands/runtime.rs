@@ -87,7 +87,10 @@ pub async fn container_start_by_id(
     container_id: String,
 ) -> Result<(), String> {
     let runtime = registry.selected();
-    runtime.start(&container_id).await.map_err(|e| e.to_string())
+    runtime
+        .start(&container_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -106,5 +109,8 @@ pub async fn container_remove_by_id(
     force: bool,
 ) -> Result<(), String> {
     let runtime = registry.selected();
-    runtime.remove(&container_id, force).await.map_err(|e| e.to_string())
+    runtime
+        .remove(&container_id, force)
+        .await
+        .map_err(|e| e.to_string())
 }

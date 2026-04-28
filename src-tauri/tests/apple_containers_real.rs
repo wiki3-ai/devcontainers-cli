@@ -214,7 +214,10 @@ async fn real_create_duplicate_name_errors() {
     let _cleanup = Cleanup(name.clone());
     rt.pull(&alpine()).await.expect("pull alpine");
 
-    let cid = rt.create(&keepalive_spec(&name)).await.expect("first create");
+    let cid = rt
+        .create(&keepalive_spec(&name))
+        .await
+        .expect("first create");
     assert!(!cid.is_empty());
 
     let err = rt
