@@ -92,6 +92,13 @@ pub struct ParsedDevContainer {
     pub workspace_mount: Option<String>,
     #[serde(default)]
     pub mounts: Vec<String>,
+    /// Verbatim docker-style flags from devcontainer.json `runArgs`.
+    /// Forwarded as-is to the runtime's `create` invocation so users
+    /// can request resource limits (`--cpus=4`, `--memory=8g`),
+    /// extra capabilities, etc. Per the upstream spec these are
+    /// passed to `docker run` exactly as written.
+    #[serde(default)]
+    pub run_args: Vec<String>,
     #[serde(default)]
     pub forward_ports: Vec<u16>,
     #[serde(default)]
@@ -180,6 +187,7 @@ pub fn to_container_spec(
         ports,
         user: parsed.remote_user.clone(),
         privileged: false,
+        run_args: parsed.run_args.clone(),
     }
 }
 
@@ -356,6 +364,22 @@ mod tests {
             std::path::Path::new("/tmp/take-two"),
         );
         assert_eq!(spec_a.name, again.name);
+    }
+
+    #[test]
+    fn to_container_spec_forwards_run_args_verbatim() {
+        let parsed = ParsedDevContainer {
+            image: Some("ubuntu:24.04".into()),
+            run_args: vec!["--cpus=4".into(), "--memory=8g".into()],
+            ..Default::default()
+        };
+        let spec = to_container_spec(
+            &parsed,
+            parse_image_ref("ubuntu:24.04"),
+            "ws-1",
+            std::path::Path::new("/tmp/repo"),
+        );
+        assert_eq!(spec.run_args, vec!["--cpus=4", "--memory=8g"]);
     }
 
     #[test]

@@ -115,6 +115,7 @@ fn keepalive_spec(name: &str) -> ContainerSpec {
         ports: vec![],
         user: None,
         privileged: false,
+        run_args: vec![],
     }
 }
 

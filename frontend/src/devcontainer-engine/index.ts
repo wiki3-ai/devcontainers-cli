@@ -90,6 +90,12 @@ export interface ParsedDevContainer {
 	workspaceMount?: string;
 	mounts: string[];
 	forwardPorts: number[];
+	/**
+	 * Verbatim docker-style flags from `devcontainer.json` `runArgs`.
+	 * Forwarded to the runtime's `create` invocation as-is so users
+	 * can request resource limits (e.g. `--cpus=4`, `--memory=8g`).
+	 */
+	runArgs: string[];
 	remoteUser?: string;
 	containerEnv: Record<string, string>;
 	remoteEnv: Record<string, string | null>;
@@ -171,6 +177,7 @@ export function toParsed(config: DevContainerConfig, configFilePath?: string): P
 		dockerComposeFile?: unknown;
 		mounts?: (Mount | string)[];
 		forwardPorts?: (number | string)[];
+		runArgs?: string[];
 		workspaceFolder?: string;
 		workspaceMount?: string;
 		remoteUser?: string;
@@ -188,6 +195,7 @@ export function toParsed(config: DevContainerConfig, configFilePath?: string): P
 	const forwardPorts = (c.forwardPorts ?? [])
 		.map((p) => (typeof p === 'number' ? p : Number.parseInt(p, 10)))
 		.filter((p) => Number.isFinite(p) && p > 0 && p < 65536);
+	const runArgs = (c.runArgs ?? []).map((s) => String(s));
 	const build: DevContainerBuild | undefined = c.build
 		? {
 			dockerfile: c.build.dockerfile,
@@ -210,6 +218,7 @@ export function toParsed(config: DevContainerConfig, configFilePath?: string): P
 		workspaceMount: c.workspaceMount,
 		mounts,
 		forwardPorts,
+		runArgs,
 		remoteUser: c.remoteUser,
 		containerEnv: c.containerEnv ?? {},
 		remoteEnv: c.remoteEnv ?? {},

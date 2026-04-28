@@ -695,6 +695,18 @@ type RepoAction = 'up' | 'stop' | 'rebuild';
 
 async function repoAction(kind: RepoAction, workspaceId: string): Promise<void> {
 	const key = logKeyForWorkspace(workspaceId);
+	// Re-parse devcontainer.json from disk before every mutating
+	// action so edits the user just made (typo fixes, runArgs
+	// tweaks, …) take effect on the next Up/Rebuild without an
+	// app restart. `stop` doesn't read the config, but reloading
+	// is cheap and keeps the slot in sync.
+	if (kind !== 'stop') {
+		try {
+			await loadConfigForWorkspace(workspaceId);
+		} catch (err) {
+			logLocal(key, 'stderr', `Failed to reload devcontainer.json: ${errMsg(err)}`);
+		}
+	}
 	try {
 		const fn = {
 			up: bridge.container_up,

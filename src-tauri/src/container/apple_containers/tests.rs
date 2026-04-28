@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::cli::{
-    create_args, exec_args, image_ref_to_string, logs_args, parse_inspect, parse_list, pull_args,
-    remove_args,
+    build_args_with_dns, create_args, exec_args, image_ref_to_string, logs_args, parse_inspect,
+    parse_list, pull_args, remove_args,
 };
 use crate::container::traits::{
-    ContainerSpec, ContainerState, ExecOptions, ImageRef, LogOptions, MountKind, MountSpec,
-    PortForward, PortProtocol,
+    BuildSpec, ContainerSpec, ContainerState, ExecOptions, ImageRef, LogOptions, MountKind,
+    MountSpec, PortForward, PortProtocol,
 };
 
 fn ubuntu() -> ImageRef {
@@ -73,6 +73,7 @@ fn create_args_sorts_env_and_appends_image_last() {
         }],
         user: Some("vscode".into()),
         privileged: false,
+        run_args: vec![],
     };
     let args = create_args(&spec);
 
@@ -116,6 +117,7 @@ fn create_args_marks_readonly_bind() {
         ports: vec![],
         user: None,
         privileged: true,
+        run_args: vec![],
     };
     let args = create_args(&spec);
     let mount = args.iter().position(|a| a == "--mount").unwrap();
@@ -127,9 +129,62 @@ fn create_args_marks_readonly_bind() {
 }
 
 #[test]
+fn create_args_inserts_run_args_before_image() {
+    let spec = ContainerSpec {
+        name: "rg".into(),
+        image: ubuntu(),
+        command: None,
+        workdir: None,
+        env: HashMap::new(),
+        mounts: vec![],
+        ports: vec![],
+        user: None,
+        privileged: false,
+        run_args: vec!["--cpus=4".into(), "--memory=8g".into()],
+    };
+    let args = create_args(&spec);
+    let img_idx = args.iter().position(|a| a == "ubuntu:24.04").unwrap();
+    // run_args appear contiguously in order, immediately before the image.
+    assert_eq!(args[img_idx - 2], "--cpus=4");
+    assert_eq!(args[img_idx - 1], "--memory=8g");
+}
+
+#[test]
 fn remove_args_force_flag() {
     assert_eq!(remove_args("abc", false), vec!["delete", "abc"]);
     assert_eq!(remove_args("abc", true), vec!["delete", "--force", "abc"]);
+}
+
+#[test]
+fn build_args_appends_dns_before_context() {
+    let spec = BuildSpec {
+        tag: ubuntu(),
+        context_dir: PathBuf::from("/ctx"),
+        dockerfile: PathBuf::from("/ctx/Dockerfile"),
+        build_args: HashMap::new(),
+        target: None,
+    };
+    let dns = vec!["192.168.1.1".to_string(), "1.1.1.1".to_string()];
+    let a = build_args_with_dns(&spec, &dns);
+    let ctx_idx = a.iter().position(|x| x == "/ctx").unwrap();
+    // `--dns IP --dns IP` immediately precedes the context dir.
+    assert_eq!(a[ctx_idx - 4], "--dns");
+    assert_eq!(a[ctx_idx - 3], "192.168.1.1");
+    assert_eq!(a[ctx_idx - 2], "--dns");
+    assert_eq!(a[ctx_idx - 1], "1.1.1.1");
+}
+
+#[test]
+fn build_args_with_no_dns_omits_flag() {
+    let spec = BuildSpec {
+        tag: ubuntu(),
+        context_dir: PathBuf::from("/ctx"),
+        dockerfile: PathBuf::from("/ctx/Dockerfile"),
+        build_args: HashMap::new(),
+        target: None,
+    };
+    let a = build_args_with_dns(&spec, &[]);
+    assert!(!a.iter().any(|x| x == "--dns"));
 }
 
 #[test]

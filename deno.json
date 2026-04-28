@@ -6,6 +6,7 @@
 	"tasks": {
 		"check": "deno check spec/index.ts frontend/src/devcontainer-engine/index.ts",
 		"build": "deno run --allow-read --allow-write --allow-env --allow-run --allow-net scripts/build-engine.ts",
+		"build:watch": "deno run --allow-read --allow-write --allow-env --allow-run --allow-net scripts/build-engine.ts --watch",
 		"build:check-no-node-builtins": "deno run --allow-read scripts/check-no-node-builtins.ts dist/devcontainer-engine.js"
 	},
 	"imports": {

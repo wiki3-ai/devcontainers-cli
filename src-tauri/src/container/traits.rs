@@ -80,6 +80,13 @@ pub struct ContainerSpec {
     pub ports: Vec<PortForward>,
     pub user: Option<String>,
     pub privileged: bool,
+    /// Verbatim extra arguments to pass to the runtime's `create`
+    /// invocation, sourced from the devcontainer.json `runArgs` field.
+    /// These are inserted immediately before the image reference so they
+    /// behave like `docker run` flags. The runtime is free to reject
+    /// flags it does not understand.
+    #[serde(default)]
+    pub run_args: Vec<String>,
 }
 
 /// Runtime-agnostic input for [`ContainerRuntime::build`]. The

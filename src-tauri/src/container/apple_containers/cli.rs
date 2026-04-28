@@ -71,6 +71,12 @@ pub(crate) fn pull_args(image: &ImageRef) -> Vec<String> {
 /// Apple's `container` CLI mirrors Docker/Podman's flags here. Build
 /// args are sorted so the argv is deterministic for tests.
 pub(crate) fn build_args(spec: &BuildSpec) -> Vec<String> {
+    build_args_with_dns(spec, &host_dns_servers())
+}
+
+/// Same as [`build_args`] but with explicit DNS servers, so unit tests
+/// can pin the argv without depending on the host's resolver state.
+pub(crate) fn build_args_with_dns(spec: &BuildSpec, dns: &[String]) -> Vec<String> {
     let mut a = vec![
         "build".to_string(),
         "--tag".to_string(),
@@ -88,8 +94,74 @@ pub(crate) fn build_args(spec: &BuildSpec) -> Vec<String> {
         a.push("--target".to_string());
         a.push(target.clone());
     }
+    // Prepend the host's resolvers as `--dns` flags so the build VM
+    // does not start with an empty resolver list. Apple's buildkit
+    // sandbox otherwise inherits no DNS, which surfaces as the
+    // "Could not resolve host: github.com" failures users see when a
+    // Dockerfile RUN step does an HTTP fetch. Each entry is passed
+    // verbatim; if the host has no resolvers configured we simply
+    // omit the flags and let the runtime's defaults apply.
+    for ip in dns {
+        a.push("--dns".to_string());
+        a.push(ip.clone());
+    }
     a.push(spec.context_dir.display().to_string());
     a
+}
+
+/// Discover the host's currently-active DNS resolver IPs so we can
+/// hand them to `container build --dns ...`. macOS does not expose its
+/// DNS *cache* (mDNSResponder is opaque), but the *resolvers* it is
+/// configured with are reachable via `scutil --dns`. Reusing them in
+/// the build sandbox means the build hits the same upstream resolver
+/// the host is already using — typically the user's router or ISP,
+/// which has its own cache — instead of relying on whatever empty
+/// default the buildkit VM ships with.
+///
+/// Returns an empty Vec on any failure so the caller can simply omit
+/// the `--dns` flags. Order is preserved (primary resolver first) and
+/// duplicates are removed. We cap at 3 to mirror the typical
+/// `/etc/resolv.conf` limit; passing a hundred resolvers serves no
+/// purpose.
+fn host_dns_servers() -> Vec<String> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let out = match std::process::Command::new("scutil").arg("--dns").output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut seen = std::collections::HashSet::new();
+    let mut servers = Vec::new();
+    for line in text.lines() {
+        // Format: `  nameserver[0] : 192.168.1.1`
+        let trimmed = line.trim();
+        if !trimmed.starts_with("nameserver") {
+            continue;
+        }
+        let Some((_, ip)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let ip = ip.trim();
+        if ip.is_empty() || !looks_like_ip(ip) {
+            continue;
+        }
+        if seen.insert(ip.to_string()) {
+            servers.push(ip.to_string());
+            if servers.len() >= 3 {
+                break;
+            }
+        }
+    }
+    servers
+}
+
+/// Cheap sanity check: accept anything that parses as an IPv4 or IPv6
+/// address. We're not validating reachability — the runtime will
+/// surface its own error if the address is unusable.
+fn looks_like_ip(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
 }
 
 pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<String> {
@@ -130,6 +202,15 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<String> {
     }
     if spec.privileged {
         a.push("--privileged".to_string());
+    }
+
+    // Verbatim devcontainer.json `runArgs`. Inserted immediately
+    // before the image so they behave like `docker run` flags. We
+    // do not interpret or filter them — Apple's `container create`
+    // accepts a subset (`--cpus`, `--memory`, etc.) and will surface
+    // its own error for anything it does not understand.
+    for raw in &spec.run_args {
+        a.push(raw.clone());
     }
 
     a.push(image_ref_to_string(&spec.image));
