@@ -238,7 +238,10 @@ impl ContainerRuntime for AppleContainersRuntime {
                 Ok(status) if matches!(status.state, ContainerState::Running) => return Ok(()),
                 Ok(_) | Err(_) => {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                    debug!(container = container_id, attempt, "waiting for running state");
+                    debug!(
+                        container = container_id,
+                        attempt, "waiting for running state"
+                    );
                 }
             }
         }
@@ -264,8 +267,7 @@ impl ContainerRuntime for AppleContainersRuntime {
 
     async fn inspect(&self, container_id: &str) -> Result<ContainerStatus, ContainerRuntimeError> {
         ensure_container_id(container_id)?;
-        let (stdout, _) =
-            run_capturing(&self.cli, ["inspect", container_id]).await?;
+        let (stdout, _) = run_capturing(&self.cli, ["inspect", container_id]).await?;
         cli::parse_inspect(&stdout, container_id)
     }
 
@@ -477,10 +479,7 @@ impl InspectShape {
             Some(c) => (c.id, c.image, c.mounts),
             None => (None, None, Vec::new()),
         };
-        let container_id = cfg_id
-            .or(self.id)
-            .or(self.name)
-            .unwrap_or_default();
+        let container_id = cfg_id.or(self.id).or(self.name).unwrap_or_default();
         let image_ref = cfg_image
             .or(self.image)
             .and_then(|i| i.reference.or(i.name));

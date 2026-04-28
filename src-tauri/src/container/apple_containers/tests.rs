@@ -312,7 +312,10 @@ fn parse_inspect_extracts_host_mount_sources() {
     let st = parse_inspect(s, "JupyterLite-Demo").unwrap();
     assert_eq!(st.container_id, "JupyterLite-Demo");
     assert_eq!(st.state, ContainerState::Running);
-    assert_eq!(st.host_mounts, vec!["/Users/jim/Wiki3/take-two".to_string()]);
+    assert_eq!(
+        st.host_mounts,
+        vec!["/Users/jim/Wiki3/take-two".to_string()]
+    );
 }
 
 #[test]

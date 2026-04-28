@@ -112,10 +112,7 @@ impl From<ContainerRuntimeError> for LifecycleError {
     }
 }
 
-fn stage<T>(
-    stage: &'static str,
-    r: Result<T, ContainerRuntimeError>,
-) -> Result<T, LifecycleError> {
+fn stage<T>(stage: &'static str, r: Result<T, ContainerRuntimeError>) -> Result<T, LifecycleError> {
     r.map_err(|source| LifecycleError::Stage { stage, source })
 }
 
@@ -472,7 +469,13 @@ impl LifecycleOrchestrator {
         // Resolve the image: either pull a pre-built one, or build from a
         // Dockerfile. The result is the ImageRef we hand to `create`.
         let image_ref = self
-            .resolve_image(sink, runtime.as_ref(), workspace_id, host_workspace, &parsed)
+            .resolve_image(
+                sink,
+                runtime.as_ref(),
+                workspace_id,
+                host_workspace,
+                &parsed,
+            )
             .await?;
         let spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
 
@@ -483,7 +486,13 @@ impl LifecycleOrchestrator {
             "lifecycle.up starting"
         );
 
-        sink.status(workspace_id, "creating", None, Some(&spec.image.repository), None);
+        sink.status(
+            workspace_id,
+            "creating",
+            None,
+            Some(&spec.image.repository),
+            None,
+        );
         sink.log(
             workspace_id,
             LogStreamKind::System,
@@ -593,7 +602,8 @@ impl LifecycleOrchestrator {
         registry: &RuntimeRegistry,
         workspace_id: &str,
     ) -> Result<LifecycleStatus, LifecycleError> {
-        self.stop_with_sink(&TauriSink(app), registry, workspace_id).await
+        self.stop_with_sink(&TauriSink(app), registry, workspace_id)
+            .await
     }
 
     pub async fn stop_with_sink(
@@ -632,7 +642,8 @@ impl LifecycleOrchestrator {
         registry: &RuntimeRegistry,
         workspace_id: &str,
     ) -> Result<LifecycleStatus, LifecycleError> {
-        self.remove_with_sink(&TauriSink(app), registry, workspace_id).await
+        self.remove_with_sink(&TauriSink(app), registry, workspace_id)
+            .await
     }
 
     pub async fn remove_with_sink(
@@ -693,7 +704,10 @@ impl LifecycleOrchestrator {
             }
             sink.status(workspace_id, "absent", None, None, None);
         } else {
-            debug!(workspace = workspace_id, "remove: no container or parsed config");
+            debug!(
+                workspace = workspace_id,
+                "remove: no container or parsed config"
+            );
             self.record_state(workspace_id, "absent", None, None);
             sink.status(workspace_id, "absent", None, None, None);
         }
@@ -1164,10 +1178,11 @@ mod tests {
             .collect();
         assert_eq!(states, vec!["pulling", "creating", "created", "running"]);
 
-        let log_lines: Vec<String> =
-            sink.logs.lock().iter().map(|l| l.line.clone()).collect();
+        let log_lines: Vec<String> = sink.logs.lock().iter().map(|l| l.line.clone()).collect();
         assert!(
-            log_lines.iter().any(|l| l.starts_with("pulling image ubuntu")),
+            log_lines
+                .iter()
+                .any(|l| l.starts_with("pulling image ubuntu")),
             "missing pull log line; got: {log_lines:?}"
         );
         assert!(
@@ -1206,7 +1221,12 @@ mod tests {
         // The orchestrator must also push an `error` status event and a
         // stderr log line so the in-app terminal/status pill update — this
         // is the regression that gave us "error with no explanation".
-        let last = sink.statuses.lock().last().cloned().expect("status emitted");
+        let last = sink
+            .statuses
+            .lock()
+            .last()
+            .cloned()
+            .expect("status emitted");
         assert_eq!(last.state, "error");
         let detail = last.error.expect("error status carries detail");
         assert!(
@@ -1334,10 +1354,11 @@ mod tests {
         assert_eq!(states, vec!["building", "creating", "created", "running"]);
 
         // Build log lines surfaced to the dashboard.
-        let log_lines: Vec<String> =
-            sink.logs.lock().iter().map(|l| l.line.clone()).collect();
+        let log_lines: Vec<String> = sink.logs.lock().iter().map(|l| l.line.clone()).collect();
         assert!(
-            log_lines.iter().any(|l| l.contains("step 1/2: FROM python")),
+            log_lines
+                .iter()
+                .any(|l| l.contains("step 1/2: FROM python")),
             "expected build stdout in sink; got: {log_lines:?}"
         );
     }
@@ -1349,9 +1370,7 @@ mod tests {
         let o = LifecycleOrchestrator::new();
         let parsed = ParsedDevContainer {
             build: Some(DevContainerBuild::default()),
-            config_file_path: Some(PathBuf::from(
-                "/tmp/ws/.devcontainer/devcontainer.json",
-            )),
+            config_file_path: Some(PathBuf::from("/tmp/ws/.devcontainer/devcontainer.json")),
             ..Default::default()
         };
         o.set_parsed_config("ws", parsed);
