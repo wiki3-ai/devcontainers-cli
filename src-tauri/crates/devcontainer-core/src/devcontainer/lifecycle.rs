@@ -27,7 +27,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::container::{
@@ -140,6 +140,8 @@ pub enum LifecycleError {
         exit_code: i32,
         stderr_tail: String,
     },
+    #[error("hook {label} cancelled by user")]
+    HookCancelled { label: &'static str },
     #[error("unsupported devcontainer.json: {0}")]
     Unsupported(String),
 }
@@ -280,6 +282,13 @@ struct WorkspaceSlot {
     /// `remove` can re-derive the container name after an app restart
     /// or when no `container_id` was ever recorded.
     host_workspace: Option<std::path::PathBuf>,
+    /// Cancellation handle published while a long-running lifecycle
+    /// hook (e.g. `postCreateCommand`) is executing. Calling
+    /// [`LifecycleOrchestrator::cancel_hook`] fires it; the
+    /// streaming-aware `runtime.exec` races the child against this
+    /// notification and kills it on cancel. `None` when no hook is
+    /// in flight.
+    cancel: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[derive(Default)]
@@ -321,6 +330,44 @@ impl LifecycleOrchestrator {
         let mut map = self.slots.write();
         let slot = map.entry(workspace_id.to_string()).or_default();
         slot.host_workspace = Some(host_workspace.to_path_buf());
+    }
+
+    /// Cancel any in-flight lifecycle hook for `workspace_id`. Fires
+    /// the workspace's published cancel notify (set by the
+    /// streaming-aware `run_hook` / `spawn_detached_hook` while a hook
+    /// is executing) so the apple-containers exec child is killed and
+    /// the orchestrator returns a clean cancelled status. No-op when
+    /// nothing is registered.
+    ///
+    /// Importantly, this does **not** take the per-workspace lock —
+    /// `up_with_sink` already holds it. The whole point of cancel is
+    /// to break a stuck Up out of its hook.
+    pub fn cancel_hook(&self, workspace_id: &str) -> bool {
+        let cancel = self
+            .slots
+            .read()
+            .get(workspace_id)
+            .and_then(|s| s.cancel.clone());
+        if let Some(notify) = cancel {
+            notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn install_cancel(&self, workspace_id: &str) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut map = self.slots.write();
+        let slot = map.entry(workspace_id.to_string()).or_default();
+        slot.cancel = Some(notify.clone());
+        notify
+    }
+
+    fn clear_cancel(&self, workspace_id: &str) {
+        if let Some(slot) = self.slots.write().get_mut(workspace_id) {
+            slot.cancel = None;
+        }
     }
 
     /// Read-only snapshot helper used by `container_status` when no
@@ -876,7 +923,8 @@ impl LifecycleOrchestrator {
             ] {
                 if let Some(cmd) = hook {
                     run_hook(
-                        sink,
+                        self,
+                        sink_arc.clone(),
                         runtime.as_ref(),
                         workspace_id,
                         &container_id,
@@ -1205,6 +1253,7 @@ async fn postcreate_sentinel_exists(
         env: std::collections::HashMap::new(),
         user: None,
         tty: false,
+        ..Default::default()
     };
     match runtime.exec(container_id, &opts).await {
         Ok(r) => Ok(r.exit_code == 0),
@@ -1230,6 +1279,7 @@ async fn write_postcreate_sentinel(
         env: std::collections::HashMap::new(),
         user: None,
         tty: false,
+        ..Default::default()
     };
     let result = runtime.exec(container_id, &opts).await?;
     if result.exit_code != 0 {
@@ -1242,7 +1292,8 @@ async fn write_postcreate_sentinel(
 }
 
 async fn run_hook(
-    sink: &dyn EventSink,
+    orchestrator: &LifecycleOrchestrator,
+    sink: Arc<dyn EventSink>,
     runtime: &dyn ContainerRuntime,
     workspace_id: &str,
     container_id: &str,
@@ -1265,27 +1316,62 @@ async fn run_hook(
         LogStreamKind::System,
         &format!("running {label}: {}", argv.join(" ")),
     );
+    // Stream stdout/stderr lines into `sink` as they appear so the
+    // user sees progress on long-running hooks (e.g. `pip install`)
+    // instead of staring at "running postCreateCommand: …" until exit.
+    // Also publish a cancel handle on the workspace slot for the
+    // duration of the hook so the UI can break a stuck hook.
+    let cancel = orchestrator.install_cancel(workspace_id);
+    let (tx, mut rx) = mpsc::channel::<LogChunk>(256);
+    let relay_workspace = workspace_id.to_string();
+    let relay_sink = sink.clone();
+    let relay = tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            if !chunk.line.is_empty() {
+                relay_sink.log(&relay_workspace, chunk.stream, &chunk.line);
+            }
+        }
+    });
     let opts = ExecOptions {
         command: argv,
         workdir: spec.workdir.clone(),
         env: spec.env.clone(),
         user: spec.user.clone(),
         tty: false,
+        log_sink: Some(tx),
+        cancel: Some(cancel),
     };
-    let result = stage("hook", runtime.exec(container_id, &opts).await)?;
-    let stdout_text = String::from_utf8_lossy(&result.stdout);
-    let stderr_text = String::from_utf8_lossy(&result.stderr);
-    for line in stdout_text.lines() {
-        if !line.is_empty() {
-            sink.log(workspace_id, LogStreamKind::Stdout, line);
+    let exec_res = runtime.exec(container_id, &opts).await;
+    // Drop the sender by dropping `opts` (which owns it). `relay`
+    // then completes once the channel drains.
+    drop(opts);
+    let _ = relay.await;
+    orchestrator.clear_cancel(workspace_id);
+
+    let result = match exec_res {
+        Ok(r) => r,
+        Err(ContainerRuntimeError::Cancelled) => {
+            warn!(
+                workspace = workspace_id,
+                hook = label,
+                "lifecycle hook cancelled by user"
+            );
+            sink.log(
+                workspace_id,
+                LogStreamKind::System,
+                &format!("{label} cancelled"),
+            );
+            return Err(LifecycleError::HookCancelled { label });
         }
-    }
-    for line in stderr_text.lines() {
-        if !line.is_empty() {
-            sink.log(workspace_id, LogStreamKind::Stderr, line);
+        Err(source) => {
+            return Err(LifecycleError::Stage {
+                stage: "hook",
+                source,
+            })
         }
-    }
+    };
     if result.exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&result.stderr);
         // Keep the tail of stderr so the user sees what failed without
         // having to open the log pane. 1KiB is plenty for a one-line
         // "command not found" / "No such file" diagnostic.
@@ -1338,12 +1424,28 @@ fn spawn_detached_hook(
     );
     let workspace_id = workspace_id.to_string();
     let container_id = container_id.to_string();
+    // Spawn a relay task that fans streamed lines from the runtime
+    // exec into the EventSink. Detached hooks are typically
+    // long-lived (e.g. `jupyter lab`), so without streaming the user
+    // sees nothing until the process exits — which is never.
+    let (tx, mut rx) = mpsc::channel::<LogChunk>(256);
+    let relay_workspace = workspace_id.clone();
+    let relay_sink = sink.clone();
+    let relay = tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            if !chunk.line.is_empty() {
+                relay_sink.log(&relay_workspace, chunk.stream, &chunk.line);
+            }
+        }
+    });
     let opts = ExecOptions {
         command: argv,
         workdir: spec.workdir.clone(),
         env: spec.env.clone(),
         user: spec.user.clone(),
         tty: false,
+        log_sink: Some(tx),
+        cancel: None,
     };
     tokio::spawn(async move {
         info!(
@@ -1352,21 +1454,15 @@ fn spawn_detached_hook(
             hook = label,
             "running detached lifecycle hook"
         );
-        match runtime.exec(&container_id, &opts).await {
+        let exec_res = runtime.exec(&container_id, &opts).await;
+        // Drop `opts` to close the streaming sender so the relay
+        // task drains and exits.
+        drop(opts);
+        let _ = relay.await;
+        match exec_res {
             Ok(result) => {
-                let stdout_text = String::from_utf8_lossy(&result.stdout);
-                for line in stdout_text.lines() {
-                    if !line.is_empty() {
-                        sink.log(&workspace_id, LogStreamKind::Stdout, line);
-                    }
-                }
-                let stderr_text = String::from_utf8_lossy(&result.stderr);
-                for line in stderr_text.lines() {
-                    if !line.is_empty() {
-                        sink.log(&workspace_id, LogStreamKind::Stderr, line);
-                    }
-                }
                 if result.exit_code != 0 {
+                    let stderr_text = String::from_utf8_lossy(&result.stderr);
                     let mut tail = stderr_text.trim().to_string();
                     if tail.len() > 1024 {
                         let start = tail.len() - 1024;

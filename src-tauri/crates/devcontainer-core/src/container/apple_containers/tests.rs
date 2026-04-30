@@ -204,6 +204,7 @@ fn exec_args_orders_options() {
         env,
         user: Some("root".into()),
         tty: true,
+        ..Default::default()
     };
     let a = exec_args("cid", &opts);
     assert_eq!(a[0], "exec");

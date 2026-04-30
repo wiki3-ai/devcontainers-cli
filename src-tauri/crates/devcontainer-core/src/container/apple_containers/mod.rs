@@ -13,6 +13,7 @@
 use std::ffi::OsStr;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -377,29 +378,113 @@ impl ContainerRuntime for AppleContainersRuntime {
             argv = ?args,
             "running container exec"
         );
+
+        // Fast path: no streaming, no cancellation -> single-shot
+        // `output()` is the simplest correct thing.
+        if options.log_sink.is_none() && options.cancel.is_none() {
+            let mut cmd = self.cli.command();
+            for a in &args {
+                cmd.arg(a);
+            }
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = cmd.output().await.map_err(|e| {
+                ContainerRuntimeError::Backend(format!("spawn `container exec`: {e}"))
+            })?;
+            let exit_code = output.status.code().unwrap_or(-1);
+            if exit_code != 0 {
+                warn!(
+                    binary = self.cli.binary(),
+                    argv = ?args,
+                    exit_code,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "container exec exited non-zero",
+                );
+            }
+            return Ok(ExecResult {
+                exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+
+        // Streaming / cancellable path. Spawn the child with piped
+        // stdio, fan stdout+stderr through line-readers that:
+        //   1. forward each line to `options.log_sink` (if any), and
+        //   2. accumulate the bytes for the eventual `ExecResult`.
+        // Race the child against `options.cancel`; on cancellation we
+        // drop the child (kill_on_drop terminates it) and return
+        // `Cancelled` so the orchestrator can surface a clean status.
         let mut cmd = self.cli.command();
         for a in &args {
             cmd.arg(a);
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = cmd
-            .output()
-            .await
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
             .map_err(|e| ContainerRuntimeError::Backend(format!("spawn `container exec`: {e}")))?;
-        let exit_code = output.status.code().unwrap_or(-1);
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ContainerRuntimeError::Backend("no stdout from `container exec`".into())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ContainerRuntimeError::Backend("no stderr from `container exec`".into())
+        })?;
+
+        let stdout_buf = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let stderr_buf = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let stdout_h = spawn_stream_pump(
+            stdout,
+            LogStreamKind::Stdout,
+            stdout_buf.clone(),
+            options.log_sink.clone(),
+        );
+        let stderr_h = spawn_stream_pump(
+            stderr,
+            LogStreamKind::Stderr,
+            stderr_buf.clone(),
+            options.log_sink.clone(),
+        );
+
+        let exit_status = if let Some(notify) = options.cancel.clone() {
+            tokio::select! {
+                biased;
+                _ = notify.notified() => {
+                    // Dropping `child` (with kill_on_drop) terminates
+                    // the local `container exec` process. The pumps
+                    // exit when their pipes close.
+                    drop(child);
+                    let _ = stdout_h.await;
+                    let _ = stderr_h.await;
+                    return Err(ContainerRuntimeError::Cancelled);
+                }
+                res = child.wait() => res,
+            }
+        } else {
+            child.wait().await
+        }
+        .map_err(|e| ContainerRuntimeError::Backend(format!("await `container exec`: {e}")))?;
+
+        let _ = stdout_h.await;
+        let _ = stderr_h.await;
+
+        let exit_code = exit_status.code().unwrap_or(-1);
+        let stdout_bytes = std::mem::take(&mut *stdout_buf.lock());
+        let stderr_bytes = std::mem::take(&mut *stderr_buf.lock());
         if exit_code != 0 {
             warn!(
                 binary = self.cli.binary(),
                 argv = ?args,
                 exit_code,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                stderr = %String::from_utf8_lossy(&stderr_bytes).trim(),
                 "container exec exited non-zero",
             );
         }
         Ok(ExecResult {
             exit_code,
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
         })
     }
 
@@ -455,6 +540,38 @@ where
             }
         }
     });
+}
+
+/// Pump that fans each line into both an accumulating byte buffer
+/// (for the eventual `ExecResult`) and an optional caller-supplied
+/// streaming sink. Used by `exec` when the caller wants to see output
+/// live (e.g. lifecycle hooks). Returns a join handle so callers can
+/// await full drain of the pipe before reading the buffer.
+fn spawn_stream_pump<R>(
+    reader: R,
+    kind: LogStreamKind,
+    buf: Arc<parking_lot::Mutex<Vec<u8>>>,
+    sink: Option<mpsc::Sender<LogChunk>>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            {
+                let mut b = buf.lock();
+                b.extend_from_slice(line.as_bytes());
+                b.push(b'\n');
+            }
+            if let Some(tx) = sink.as_ref() {
+                // A closed sink shouldn't terminate the pump — we
+                // still want to keep reading so the child's pipe
+                // doesn't fill and block. Just stop forwarding.
+                let _ = tx.send(LogChunk { stream: kind, line }).await;
+            }
+        }
+    })
 }
 
 async fn run_capturing<I, S>(

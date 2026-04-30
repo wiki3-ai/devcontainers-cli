@@ -26,6 +26,8 @@ pub enum ContainerRuntimeError {
     Io(#[from] std::io::Error),
     #[error("backend reported failure: {0}")]
     Backend(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,13 +148,30 @@ pub enum ContainerState {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecOptions {
     pub command: Vec<String>,
     pub workdir: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub user: Option<String>,
     pub tty: bool,
+    /// Optional sink that receives stdout/stderr lines as they appear
+    /// (rather than only after the process exits). Backends that
+    /// support streaming should forward every line; if `None` the
+    /// implementation is free to buffer and only populate
+    /// [`ExecResult::stdout`] / [`ExecResult::stderr`] on exit.
+    ///
+    /// The sink is intentionally _additional_ to `ExecResult`'s byte
+    /// buffers so existing callers that only care about the final
+    /// output don't need to change.
+    pub log_sink: Option<mpsc::Sender<LogChunk>>,
+    /// Optional cancellation handle. If set, backends should race the
+    /// child process against [`Notify::notified`] and kill the child
+    /// when notified, returning [`ContainerRuntimeError::Cancelled`].
+    /// Used by the orchestrator to support an in-UI "Cancel" while a
+    /// long-running lifecycle hook (e.g. `postCreateCommand`) is
+    /// still executing.
+    pub cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 #[derive(Debug, Clone)]

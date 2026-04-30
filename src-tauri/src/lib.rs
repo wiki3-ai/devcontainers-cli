@@ -54,6 +54,7 @@ pub fn run() {
             commands::lifecycle::container_stop,
             commands::lifecycle::container_rebuild,
             commands::lifecycle::container_remove,
+            commands::lifecycle::container_cancel,
             commands::fs::fs_is_file,
             commands::fs::fs_read_file,
             commands::fs::fs_write_file,

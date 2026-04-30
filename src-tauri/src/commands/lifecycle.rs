@@ -162,3 +162,15 @@ pub async fn container_remove(
         .map(ContainerStatusDto::from)
         .map_err(|e| e.to_string())
 }
+
+/// Cancel an in-flight lifecycle hook (e.g. a stuck
+/// `postCreateCommand`). Fires the orchestrator's per-workspace
+/// cancel notify; the streaming-aware exec path kills the child and
+/// returns `Cancelled`. Returns `true` if a hook was registered.
+#[tauri::command]
+pub fn container_cancel(
+    orchestrator: State<'_, LifecycleOrchestrator>,
+    workspace_id: String,
+) -> bool {
+    orchestrator.cancel_hook(&workspace_id)
+}
