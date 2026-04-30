@@ -265,6 +265,7 @@ fn spec(name: &str) -> ContainerSpec {
         user: None,
         privileged: false,
         run_args: vec![],
+        labels: Default::default(),
     }
 }
 

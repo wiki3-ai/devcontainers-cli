@@ -380,6 +380,13 @@ pub(crate) fn system_status_is_running(stdout: &str) -> bool {
 /// `reference` matches `needle` (a fully-formed image reference such as
 /// `devcontainer-foo:latest`). Robust against missing fields and
 /// non-JSON output (returns false).
+///
+/// Match is permissive on the registry prefix: Apple's CLI reports
+/// Docker Hub images with the implicit `docker.io/library/` prefix
+/// expanded (`docker.io/library/alpine:3.19`), even when they were
+/// pulled by the bare `library/alpine:3.19` ref. So we accept either
+/// an exact match or a suffix match against `/<needle>` so the cache
+/// hit fires regardless of how the caller spelled the reference.
 pub(crate) fn image_list_contains(stdout: &str, needle: &str) -> bool {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -391,7 +398,7 @@ pub(crate) fn image_list_contains(stdout: &str, needle: &str) -> bool {
     arr.iter().any(|v| {
         v.get("reference")
             .and_then(|r| r.as_str())
-            .map(|s| s == needle)
+            .map(|s| s == needle || s.ends_with(&format!("/{needle}")))
             .unwrap_or(false)
     })
 }

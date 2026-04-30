@@ -362,6 +362,21 @@ fn image_list_contains_matches_reference() {
 }
 
 #[test]
+fn image_list_contains_matches_implicit_docker_io_prefix() {
+    // Apple's `container image list` reports Docker Hub images with the
+    // implicit `docker.io/library/` prefix expanded, even when they
+    // were pulled with the bare `library/alpine` ref. The cache-hit
+    // probe must still fire in that case.
+    let stdout = r#"[
+        {"reference":"docker.io/library/alpine:3.19"},
+        {"reference":"docker.io/library/ubuntu:24.04"}
+    ]"#;
+    assert!(image_list_contains(stdout, "library/alpine:3.19"));
+    assert!(image_list_contains(stdout, "docker.io/library/alpine:3.19"));
+    assert!(!image_list_contains(stdout, "library/busybox:latest"));
+}
+
+#[test]
 fn image_label_from_inspect_reads_nested_labels() {
     let stdout = r#"[{
         "variants":[

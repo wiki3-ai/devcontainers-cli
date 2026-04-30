@@ -116,6 +116,7 @@ fn keepalive_spec(name: &str) -> ContainerSpec {
         user: None,
         privileged: false,
         run_args: vec![],
+        labels: Default::default(),
     }
 }
 
@@ -269,4 +270,89 @@ async fn real_empty_id_rejected_before_shelling_out() {
             "expected local guard, got: {msg}",
         );
     }
+}
+
+/// `ensure_system_running` must succeed (returning `Ok(())`) when the
+/// real `container system` daemon is reachable. We can't assert on the
+/// exact log lines (depends on whether the daemon was already up), but
+/// any error here means our parsing of `container system status` /
+/// startup of `container system start` is broken.
+#[tokio::test]
+async fn real_ensure_system_running_succeeds() {
+    require_cli!();
+    let rt = rt();
+    rt.ensure_system_running(None)
+        .await
+        .expect("ensure_system_running against real CLI");
+    // Second call must be a no-op (cached) and still succeed.
+    rt.ensure_system_running(None)
+        .await
+        .expect("ensure_system_running second call");
+}
+
+/// `image_exists` must return true for an image we just pulled and
+/// false for a clearly-bogus tag. This pins the JSON shape of
+/// `container image list --format json`.
+#[tokio::test]
+async fn real_image_exists_round_trips() {
+    require_cli!();
+    let rt = rt();
+    rt.pull(&alpine()).await.expect("pull alpine");
+    let exists = rt
+        .image_exists(&alpine())
+        .await
+        .expect("image_exists alpine");
+    assert!(exists, "alpine:3.19 must be reported present after pull");
+
+    let bogus_ref = ImageRef {
+        registry: None,
+        repository: "library/definitely-not-a-real-image".into(),
+        tag: Some("zzz".into()),
+        digest: None,
+    };
+    let bogus = rt
+        .image_exists(&bogus_ref)
+        .await
+        .expect("image_exists bogus");
+    assert!(!bogus, "bogus image must report absent");
+}
+
+/// Creating with `labels` must round-trip: inspect must surface the
+/// label back through `ContainerStatus.labels` (i.e. our parsing of
+/// `configuration.labels` is correct), so drift detection works.
+#[tokio::test]
+async fn real_container_labels_round_trip_on_inspect() {
+    require_cli!();
+    let rt = rt();
+    let name = unique_name("lbl");
+    let _cleanup = Cleanup(name.clone());
+    rt.pull(&alpine()).await.expect("pull alpine");
+
+    let mut spec = keepalive_spec(&name);
+    spec.labels.insert(
+        "org.devcontainers.config_hash".to_string(),
+        "deadbeef".to_string(),
+    );
+    spec.labels
+        .insert("dcc.test.marker".to_string(), "round-trip".to_string());
+
+    let cid = rt.create(&spec).await.expect("create with labels");
+    rt.start(&cid).await.expect("start");
+
+    let status = rt.inspect(&cid).await.expect("inspect");
+    assert_eq!(
+        status.labels.get("org.devcontainers.config_hash").map(String::as_str),
+        Some("deadbeef"),
+        "config_hash label must round-trip; got labels={:?}",
+        status.labels,
+    );
+    assert_eq!(
+        status.labels.get("dcc.test.marker").map(String::as_str),
+        Some("round-trip"),
+        "custom label must round-trip; got labels={:?}",
+        status.labels,
+    );
+
+    rt.stop(&cid).await.expect("stop");
+    rt.remove(&cid, true).await.expect("remove");
 }
