@@ -362,15 +362,11 @@ impl LifecycleOrchestrator {
         host_workspace: &Path,
     ) -> LifecycleStatus {
         let mut snap = self.snapshot(workspace_id);
-        let parsed = match self
+        let parsed = self
             .slots
             .read()
             .get(workspace_id)
-            .and_then(|s| s.parsed.clone())
-        {
-            Some(p) => p,
-            None => return snap,
-        };
+            .and_then(|s| s.parsed.clone());
 
         let runtime = registry.selected();
         // Make sure host_workspace is on the slot before we try to
@@ -384,6 +380,12 @@ impl LifecycleOrchestrator {
         // checks happen on a poll and shouldn't surface as an error or
         // boot the daemon as a side-effect; if inspect fails we just
         // leave drift unset.
+        //
+        // Adoption runs even without a parsed config: at app startup
+        // the frontend hasn't submitted devcontainer.json yet, but a
+        // container created in a previous session is still findable by
+        // its deterministic derived name, so we surface its real state
+        // rather than "absent".
         let recorded = self
             .slots
             .read()
@@ -438,6 +440,13 @@ impl LifecycleOrchestrator {
             crate::container::ContainerState::Unknown => "unknown",
         };
         let stamped = live.labels.get(LABEL_CONFIG_HASH).cloned();
+        // Drift is undecidable without a parsed config; that's the
+        // expected state right after app startup before the frontend
+        // has had a chance to submit one. Adoption above has already
+        // populated the live state on the snapshot.
+        let Some(parsed) = parsed else {
+            return snap;
+        };
         let dockerfile_path: Option<std::path::PathBuf> = parsed.build.as_ref().map(|b| {
             let cfg_dir: std::path::PathBuf = parsed
                 .config_file_path
