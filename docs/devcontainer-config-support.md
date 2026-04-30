@@ -71,6 +71,32 @@ isn't up, a `container system start` invocation whose log lines (
 piped into the dashboard log pane. The result is cached in an
 `AtomicBool` on the runtime so subsequent calls are free.
 
+The same step also makes a one-time best-effort attempt to register
+`host.docker.internal` as a localhost-redirect DNS domain. Apple's
+`container` runtime has no built-in equivalent of Docker Desktop's
+`host.docker.internal`; the documented mechanism is `sudo container
+system dns create <domain> --localhost <ipv4-addr>`, which writes a
+scoped resolver under `/etc/resolver/<domain>` and reloads
+`mDNSResponder` plus a packet-filter rule that forwards `<ipv4-addr>`
+back to `127.0.0.1` on the host. The backend:
+
+1. runs `container system dns ls` (no privilege required) and skips
+   out if `host.docker.internal` is already there;
+2. otherwise shells out via `osascript -e 'do shell script "<container>
+   system dns create host.docker.internal --localhost 203.0.113.113"
+   with administrator privileges'`, surfacing the standard macOS auth
+   dialog exactly once. The redirect IP is `203.0.113.113` from the
+   RFC 5737 documentation range so it cannot collide with real
+   networks.
+
+The registration persists across host reboots until the user runs
+`sudo container system dns delete host.docker.internal`. If the user
+cancels the prompt or the command fails for any other reason the
+backend logs a warning and continues — every other lifecycle op is
+unaffected, only resolution of `host.docker.internal` from inside
+containers will not work. An `AtomicBool` on the runtime guarantees
+the prompt is shown at most once per process.
+
 `LifecycleOrchestrator::resolve_image` decides per-workspace what to do:
 
 ```
