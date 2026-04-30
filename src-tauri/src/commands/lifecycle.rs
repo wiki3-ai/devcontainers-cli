@@ -92,7 +92,7 @@ pub async fn container_up(
     let path = resolve_workspace(&state, &workspace_id)?;
     orchestrator
         .up_with_sink(
-            &crate::tauri_sink::TauriSink(&app),
+            std::sync::Arc::new(crate::tauri_sink::TauriSink(app.clone())),
             &registry,
             &workspace_id,
             &path,
@@ -113,7 +113,7 @@ pub async fn container_stop(
     resolve_workspace(&state, &workspace_id)?;
     orchestrator
         .stop_with_sink(
-            &crate::tauri_sink::TauriSink(&app),
+            &crate::tauri_sink::TauriSink(app.clone()),
             &registry,
             &workspace_id,
         )
@@ -133,7 +133,7 @@ pub async fn container_rebuild(
     let path = resolve_workspace(&state, &workspace_id)?;
     orchestrator
         .rebuild_with_sink(
-            &crate::tauri_sink::TauriSink(&app),
+            std::sync::Arc::new(crate::tauri_sink::TauriSink(app.clone())),
             &registry,
             &workspace_id,
             &path,
@@ -154,7 +154,7 @@ pub async fn container_remove(
     resolve_workspace(&state, &workspace_id)?;
     orchestrator
         .remove_with_sink(
-            &crate::tauri_sink::TauriSink(&app),
+            &crate::tauri_sink::TauriSink(app.clone()),
             &registry,
             &workspace_id,
         )

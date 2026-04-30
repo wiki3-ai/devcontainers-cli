@@ -498,9 +498,15 @@ impl LifecycleOrchestrator {
     /// Drive `pull → create → start` and run the post-create/start/attach
     /// lifecycle hooks against the selected runtime. Sink-parameterised so
     /// tests can capture the emitted events without a real Tauri app.
+    ///
+    /// The sink is passed as `Arc<dyn EventSink>` (rather than
+    /// `&dyn EventSink`) so detached lifecycle hooks — e.g. a
+    /// long-running `postStartCommand` that spawns `jupyter lab` —
+    /// can clone the handle and continue streaming output to the
+    /// host's UI after this method returns.
     pub async fn up_with_sink(
         &self,
-        sink: &dyn EventSink,
+        sink: Arc<dyn EventSink>,
         registry: &RuntimeRegistry,
         workspace_id: &str,
         host_workspace: &Path,
@@ -518,10 +524,10 @@ impl LifecycleOrchestrator {
         }
 
         let result = self
-            .up_inner(sink, registry, workspace_id, host_workspace)
+            .up_inner(sink.clone(), registry, workspace_id, host_workspace)
             .await;
         if let Err(err) = &result {
-            self.report_failure(sink, workspace_id, "up", err);
+            self.report_failure(sink.as_ref(), workspace_id, "up", err);
         }
         result
     }
@@ -698,11 +704,17 @@ impl LifecycleOrchestrator {
 
     async fn up_inner(
         &self,
-        sink: &dyn EventSink,
+        sink: Arc<dyn EventSink>,
         registry: &RuntimeRegistry,
         workspace_id: &str,
         host_workspace: &Path,
     ) -> Result<LifecycleStatus, LifecycleError> {
+        // Most call sites in this method want a `&dyn EventSink`. Hold
+        // the Arc for the entire body so it stays alive, and reborrow
+        // a reference for the synchronous helpers. The detached
+        // postStart/postAttach hooks below clone the Arc itself.
+        let sink_arc = sink;
+        let sink: &dyn EventSink = sink_arc.as_ref();
         let parsed = self.parsed(workspace_id)?;
         let runtime = registry.selected();
         validate_supported(&parsed)?;
@@ -894,10 +906,10 @@ impl LifecycleOrchestrator {
                 // Awaiting them here would hold the per-workspace
                 // lock indefinitely and silently block every
                 // subsequent Stop / Restart / Rebuild / Remove. Spawn
-                // them detached: the user sees a system-stream log
-                // line, and the orchestrator returns control.
+                // them detached: output continues streaming via the
+                // Arc'd sink, and the orchestrator returns control.
                 spawn_detached_hook(
-                    sink,
+                    sink_arc.clone(),
                     runtime.clone(),
                     workspace_id,
                     &container_id,
@@ -1055,7 +1067,7 @@ impl LifecycleOrchestrator {
 
     pub async fn rebuild_with_sink(
         &self,
-        sink: &dyn EventSink,
+        sink: Arc<dyn EventSink>,
         registry: &RuntimeRegistry,
         workspace_id: &str,
         host_workspace: &Path,
@@ -1063,7 +1075,8 @@ impl LifecycleOrchestrator {
         // `up` and `remove` already grab the per-workspace lock, so call
         // them sequentially without holding it ourselves.
         info!(workspace = workspace_id, "lifecycle.rebuild");
-        self.remove_with_sink(sink, registry, workspace_id).await?;
+        self.remove_with_sink(sink.as_ref(), registry, workspace_id)
+            .await?;
         self.up_with_sink(sink, registry, workspace_id, host_workspace)
             .await
     }
@@ -1290,13 +1303,11 @@ async fn run_hook(
 
 /// Spawn a lifecycle hook detached on the tokio runtime so the
 /// orchestrator can return control even when the hook never exits
-/// (e.g. `postStartCommand: "jupyter lab"`). Output and the eventual
-/// exit code are reported via `tracing` only — we don't have a
-/// 'static [`EventSink`] handle here. The user sees a single
-/// system-stream "started <hook> in background" line through the
-/// caller's sink before this returns.
+/// (e.g. `postStartCommand: "jupyter lab"`). Output continues to
+/// stream into the host's UI via the cloned sink for as long as the
+/// hook runs, and the eventual exit code is reported the same way.
 fn spawn_detached_hook(
-    sink: &dyn EventSink,
+    sink: Arc<dyn EventSink>,
     runtime: Arc<dyn ContainerRuntime>,
     workspace_id: &str,
     container_id: &str,
@@ -1334,8 +1345,19 @@ fn spawn_detached_hook(
         );
         match runtime.exec(&container_id, &opts).await {
             Ok(result) => {
+                let stdout_text = String::from_utf8_lossy(&result.stdout);
+                for line in stdout_text.lines() {
+                    if !line.is_empty() {
+                        sink.log(&workspace_id, LogStreamKind::Stdout, line);
+                    }
+                }
+                let stderr_text = String::from_utf8_lossy(&result.stderr);
+                for line in stderr_text.lines() {
+                    if !line.is_empty() {
+                        sink.log(&workspace_id, LogStreamKind::Stderr, line);
+                    }
+                }
                 if result.exit_code != 0 {
-                    let stderr_text = String::from_utf8_lossy(&result.stderr);
                     let mut tail = stderr_text.trim().to_string();
                     if tail.len() > 1024 {
                         let start = tail.len() - 1024;
@@ -1348,11 +1370,21 @@ fn spawn_detached_hook(
                         stderr = %tail,
                         "detached lifecycle hook exited non-zero"
                     );
+                    sink.log(
+                        &workspace_id,
+                        LogStreamKind::System,
+                        &format!("{label} exited with code {}", result.exit_code),
+                    );
                 } else {
                     info!(
                         workspace = %workspace_id,
                         hook = label,
                         "detached lifecycle hook exited cleanly"
+                    );
+                    sink.log(
+                        &workspace_id,
+                        LogStreamKind::System,
+                        &format!("{label} finished"),
                     );
                 }
             }
@@ -1362,6 +1394,11 @@ fn spawn_detached_hook(
                     hook = label,
                     error = %err,
                     "detached lifecycle hook failed to launch"
+                );
+                sink.log(
+                    &workspace_id,
+                    LogStreamKind::System,
+                    &format!("{label} failed to launch: {err}"),
                 );
             }
         }
@@ -1692,10 +1729,10 @@ mod tests {
         let o = LifecycleOrchestrator::new();
         o.set_parsed_config("ws", parsed_with_image("ubuntu:24.04"));
         let registry = registry_with(FakeRuntime::new(FakeScript::default()));
-        let sink = CapturingSink::default();
+        let sink = Arc::new(CapturingSink::default());
 
         let status = o
-            .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .up_with_sink(sink.clone(), &registry, "ws", &PathBuf::from("/tmp/ws"))
             .await
             .expect("up should succeed");
         assert_eq!(status.state, "running");
@@ -1731,10 +1768,10 @@ mod tests {
             pull_err: Some("manifest unknown for ubuntu:24.04".into()),
             ..Default::default()
         }));
-        let sink = CapturingSink::default();
+        let sink = Arc::new(CapturingSink::default());
 
         let err = o
-            .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .up_with_sink(sink.clone(), &registry, "ws", &PathBuf::from("/tmp/ws"))
             .await
             .expect_err("up should fail when pull fails");
 
@@ -1794,10 +1831,10 @@ mod tests {
         // Pre-seed a stale container id so `remove` actually shells out.
         o.record_state("ws", "stopped", Some("old-cid"), Some("ubuntu:24.04"));
         let registry = registry_with(FakeRuntime::new(FakeScript::default()));
-        let sink = CapturingSink::default();
+        let sink = Arc::new(CapturingSink::default());
 
         let status = o
-            .rebuild_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .rebuild_with_sink(sink.clone(), &registry, "ws", &PathBuf::from("/tmp/ws"))
             .await
             .expect("rebuild should succeed");
         assert_eq!(status.state, "running");
@@ -1846,10 +1883,15 @@ mod tests {
             RuntimeId::AppleContainers,
             runtime.clone() as Arc<dyn ContainerRuntime>,
         );
-        let sink = CapturingSink::default();
+        let sink = Arc::new(CapturingSink::default());
 
         let status = o
-            .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/take-two"))
+            .up_with_sink(
+                sink.clone(),
+                &registry,
+                "ws",
+                &PathBuf::from("/tmp/take-two"),
+            )
             .await
             .expect("up should succeed for build-based config");
         assert_eq!(status.state, "running");
@@ -1909,10 +1951,10 @@ mod tests {
             build_err: Some("Dockerfile syntax error on line 3".into()),
             ..Default::default()
         }));
-        let sink = CapturingSink::default();
+        let sink = Arc::new(CapturingSink::default());
 
         let err = o
-            .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .up_with_sink(sink.clone(), &registry, "ws", &PathBuf::from("/tmp/ws"))
             .await
             .expect_err("build error must propagate");
         let msg = err.to_string();
@@ -1943,10 +1985,10 @@ mod tests {
         };
         o.set_parsed_config("ws", parsed);
         let registry = registry_with(FakeRuntime::new(FakeScript::default()));
-        let sink = CapturingSink::default();
+        let sink = Arc::new(CapturingSink::default());
 
         let err = o
-            .up_with_sink(&sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .up_with_sink(sink.clone(), &registry, "ws", &PathBuf::from("/tmp/ws"))
             .await
             .expect_err("compose config must be rejected");
         let msg = err.to_string();

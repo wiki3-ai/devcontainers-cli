@@ -14,9 +14,15 @@ use devcontainer_core::events::EventSink;
 use devcontainer_core::LogStreamKind;
 
 /// Forwards events to the running Tauri app.
-pub struct TauriSink<'a>(pub &'a AppHandle);
+///
+/// Owns the [`AppHandle`] (which is itself a cheap, clonable handle
+/// to the running app) so the sink can be wrapped in
+/// `Arc<dyn EventSink>` and outlive the calling stack frame — e.g.
+/// when a detached `postStartCommand` keeps streaming logs into the
+/// UI long after the orchestrator's `up` future has returned.
+pub struct TauriSink(pub AppHandle);
 
-impl EventSink for TauriSink<'_> {
+impl EventSink for TauriSink {
     fn status(
         &self,
         workspace_id: &str,
