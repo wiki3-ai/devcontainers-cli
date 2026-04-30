@@ -157,6 +157,89 @@ fn stage<T>(stage: &'static str, r: Result<T, ContainerRuntimeError>) -> Result<
     r.map_err(|source| LifecycleError::Stage { stage, source })
 }
 
+/// Names of the buildkit-predeclared "proxy build args". These reach
+/// RUN steps in the Dockerfile without requiring matching `ARG`
+/// lines, and are stripped from the recorded image config so they
+/// don't bake into the layer metadata.
+const PROXY_VAR_NAMES: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "FTP_PROXY",
+    "ALL_PROXY",
+];
+
+/// Merge proxy environment variables (HTTP_PROXY etc.) into a
+/// build-args map. Each name is looked up via `lookup` in both upper-
+/// and lower-case forms; the first non-empty value wins. Existing
+/// keys in `args` are never overwritten — caller-supplied build args
+/// take precedence over the host environment.
+///
+/// Host literals of `localhost`, `127.0.0.1`, and `::1` in the URL
+/// are rewritten to `host.docker.internal` so a host-side proxy
+/// reachable on the loopback interface can be reached from inside
+/// the build container. (devcontainer-core's Apple Containers
+/// backend registers `host.docker.internal` as a localhost-redirect
+/// DNS entry; on Docker Desktop / Podman it is provided by the
+/// runtime.)
+pub(crate) fn merge_proxy_build_args<F>(
+    mut args: HashMap<String, String>,
+    mut lookup: F,
+) -> HashMap<String, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    for name in PROXY_VAR_NAMES {
+        if args.contains_key(*name) {
+            continue;
+        }
+        let value = lookup(name)
+            .or_else(|| lookup(&name.to_ascii_lowercase()))
+            .filter(|v| !v.is_empty());
+        if let Some(value) = value {
+            args.insert(
+                (*name).to_string(),
+                rewrite_localhost_to_host_internal(&value),
+            );
+        }
+    }
+    args
+}
+
+/// Rewrite `localhost` / `127.0.0.1` / `::1` host components in a
+/// proxy URL to `host.docker.internal`. See [`merge_proxy_build_args`].
+fn rewrite_localhost_to_host_internal(url: &str) -> String {
+    let mut out = String::with_capacity(url.len() + 16);
+    let bytes = url.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for `://` or `@` host-literal boundaries.
+        let host_start = if bytes[i..].starts_with(b"://") {
+            out.push_str("://");
+            i + 3
+        } else if bytes[i] == b'@' {
+            out.push('@');
+            i + 1
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        };
+        let mut host_end = host_start;
+        while host_end < bytes.len() && !matches!(bytes[host_end], b':' | b'/' | b'?' | b'#') {
+            host_end += 1;
+        }
+        let host = &url[host_start..host_end];
+        let rewritten = match host.to_ascii_lowercase().as_str() {
+            "localhost" | "127.0.0.1" | "[::1]" | "::1" => "host.docker.internal",
+            _ => host,
+        };
+        out.push_str(rewritten);
+        i = host_end;
+    }
+    out
+}
+
 /// Snapshot of a workspace's container state as exposed to the WebView.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -598,7 +681,7 @@ impl LifecycleOrchestrator {
             tag,
             context_dir,
             dockerfile,
-            build_args: build.args.clone(),
+            build_args: merge_proxy_build_args(build.args.clone(), |n| std::env::var(n).ok()),
             target: build.target.clone(),
             labels: HashMap::new(),
         }
@@ -1222,6 +1305,64 @@ mod tests {
     use parking_lot::Mutex as PlMutex;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn merge_proxy_build_args_picks_up_uppercase_and_lowercase() {
+        let env = |n: &str| -> Option<String> {
+            match n {
+                "HTTPS_PROXY" => Some("http://localhost:3128".into()),
+                "http_proxy" => Some("http://127.0.0.1:3128".into()),
+                "no_proxy" => Some("localhost,host.docker.internal".into()),
+                _ => None,
+            }
+        };
+        let merged = merge_proxy_build_args(HashMap::new(), env);
+        assert_eq!(
+            merged.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://host.docker.internal:3128")
+        );
+        assert_eq!(
+            merged.get("HTTP_PROXY").map(String::as_str),
+            Some("http://host.docker.internal:3128")
+        );
+        // NO_PROXY is a comma-separated list, not a URL — left as-is.
+        assert_eq!(
+            merged.get("NO_PROXY").map(String::as_str),
+            Some("localhost,host.docker.internal")
+        );
+    }
+
+    #[test]
+    fn merge_proxy_build_args_does_not_overwrite_existing() {
+        let mut existing = HashMap::new();
+        existing.insert(
+            "HTTPS_PROXY".to_string(),
+            "http://my-proxy:8080".to_string(),
+        );
+        let merged = merge_proxy_build_args(existing, |_| Some("http://from-env:3128".into()));
+        assert_eq!(
+            merged.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://my-proxy:8080")
+        );
+    }
+
+    #[test]
+    fn merge_proxy_build_args_skips_empty_values() {
+        let merged = merge_proxy_build_args(HashMap::new(), |_| Some(String::new()));
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn rewrite_localhost_handles_userinfo_and_paths() {
+        assert_eq!(
+            rewrite_localhost_to_host_internal("http://user:pass@localhost:3128/path?q=1"),
+            "http://user:pass@host.docker.internal:3128/path?q=1"
+        );
+        assert_eq!(
+            rewrite_localhost_to_host_internal("http://proxy.corp:8080"),
+            "http://proxy.corp:8080"
+        );
+    }
 
     #[test]
     fn lifecycle_command_argv_shapes() {
