@@ -191,6 +191,34 @@ ul.workspaces li.selected {
 	color: #888;
 }
 
+.drift-banner {
+	display: flex;
+	align-items: center;
+	gap: 0.75rem;
+	margin: 0 0 0.75rem 0;
+	padding: 0.5rem 0.75rem;
+	border: 1px solid #b45309;
+	background: #fffbeb;
+	color: #78350f;
+	border-radius: 6px;
+	font-size: 0.85rem;
+}
+
+.drift-banner button {
+	margin-left: auto;
+	padding: 0.25rem 0.6rem;
+	border-radius: 4px;
+	border: 1px solid #b45309;
+	background: #b45309;
+	color: white;
+	cursor: pointer;
+	font: inherit;
+	font-size: 0.8rem;
+}
+
+.drift-banner button:hover {
+	background: #92400e;
+}
 .log-pane {
 	flex: 1;
 	min-height: 240px;

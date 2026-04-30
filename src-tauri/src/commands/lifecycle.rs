@@ -20,6 +20,11 @@ pub struct ContainerStatusDto {
     pub container_id: Option<String>,
     pub image_ref: Option<String>,
     pub error: Option<String>,
+    /// `true` when the running container's stamped config_hash label
+    /// disagrees with the on-disk devcontainer.json/Dockerfile.
+    /// Omitted when undecidable (no live container, no label, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_drift: Option<bool>,
 }
 
 impl From<LifecycleStatus> for ContainerStatusDto {
@@ -30,6 +35,7 @@ impl From<LifecycleStatus> for ContainerStatusDto {
             container_id: s.container_id,
             image_ref: s.image_ref,
             error: s.error,
+            config_drift: s.config_drift,
         }
     }
 }
@@ -59,12 +65,15 @@ pub async fn submit_parsed_devcontainer(
 #[tauri::command]
 pub async fn container_status(
     state: State<'_, HostState>,
-    _registry: State<'_, RuntimeRegistry>,
+    registry: State<'_, RuntimeRegistry>,
     orchestrator: State<'_, LifecycleOrchestrator>,
     workspace_id: String,
 ) -> Result<ContainerStatusDto, String> {
-    resolve_workspace(&state, &workspace_id)?;
-    Ok(orchestrator.snapshot(&workspace_id).into())
+    let path = resolve_workspace(&state, &workspace_id)?;
+    Ok(orchestrator
+        .status_with_drift(&registry, &workspace_id, &path)
+        .await
+        .into())
 }
 
 #[tauri::command]

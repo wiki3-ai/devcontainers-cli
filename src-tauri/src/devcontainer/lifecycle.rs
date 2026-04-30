@@ -226,6 +226,14 @@ pub struct LifecycleStatus {
     pub image_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `true` when the running/stopped container's stamped
+    /// `config_hash` label disagrees with the current contents of
+    /// `devcontainer.json` (and Dockerfile, if `build:`). `false` when
+    /// the labels match, `None` when we couldn't decide (no live
+    /// container, no recorded hash, etc.). Drives the dashboard's
+    /// non-modal "Configuration changed — Rebuild?" banner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_drift: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -282,6 +290,7 @@ impl LifecycleOrchestrator {
                 container_id: slot.container_id.clone(),
                 image_ref: slot.last_image_ref.clone(),
                 error: slot.last_error.clone(),
+                config_drift: None,
             };
         }
         LifecycleStatus {
@@ -290,7 +299,82 @@ impl LifecycleOrchestrator {
             container_id: None,
             image_ref: None,
             error: None,
+            config_drift: None,
         }
+    }
+
+    /// Status with drift detection. Inspects the live container (if any),
+    /// reads its stamped `org.devcontainers.config_hash` label, and
+    /// compares it against a freshly-recomputed hash of
+    /// `devcontainer.json` (+ Dockerfile, when applicable). On any
+    /// failure to determine the answer (no live container, label
+    /// missing, parsed config absent) drift is reported as `None`
+    /// rather than `false` so the UI can distinguish "definitely up to
+    /// date" from "we don't know".
+    pub async fn status_with_drift(
+        &self,
+        registry: &RuntimeRegistry,
+        workspace_id: &str,
+        host_workspace: &Path,
+    ) -> LifecycleStatus {
+        let mut snap = self.snapshot(workspace_id);
+        let parsed = match self
+            .slots
+            .read()
+            .get(workspace_id)
+            .and_then(|s| s.parsed.clone())
+        {
+            Some(p) => p,
+            None => return snap,
+        };
+
+        let runtime = registry.selected();
+        // Look up the container by recorded id, falling back to the
+        // derived name. We don't ensure_system_running here — drift
+        // checks happen on a poll and shouldn't surface as an error or
+        // boot the daemon as a side-effect; if inspect fails we just
+        // leave drift unset.
+        let target = self
+            .slots
+            .read()
+            .get(workspace_id)
+            .and_then(|s| s.container_id.clone())
+            .or_else(|| {
+                let map = self.slots.read();
+                let slot = map.get(workspace_id)?;
+                let host = slot.host_workspace.as_ref()?;
+                Some(derive_container_name(workspace_id, host))
+            });
+        let Some(cid) = target else {
+            return snap;
+        };
+        let live = match runtime.inspect(&cid).await {
+            Ok(s) => s,
+            Err(_) => return snap,
+        };
+        // Surface the live container id on the snapshot if we hadn't
+        // recorded it yet (e.g., adopted-by-name path after restart).
+        if snap.container_id.is_none() && !live.container_id.is_empty() {
+            snap.container_id = Some(live.container_id.clone());
+        }
+        if snap.image_ref.is_none() {
+            snap.image_ref = live.image_ref.clone();
+        }
+        let stamped = live.labels.get(LABEL_CONFIG_HASH).cloned();
+        let dockerfile_path: Option<std::path::PathBuf> = parsed.build.as_ref().map(|b| {
+            let cfg_dir: std::path::PathBuf = parsed
+                .config_file_path
+                .as_ref()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| host_workspace.join(".devcontainer"));
+            cfg_dir.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"))
+        });
+        let current = compute_config_hash(&parsed, dockerfile_path.as_deref());
+        snap.config_drift = match (stamped, current) {
+            (Some(s), Some(c)) => Some(s != c),
+            _ => None,
+        };
+        snap
     }
 
     fn lock_for(&self, workspace_id: &str) -> Arc<Mutex<()>> {
@@ -611,6 +695,7 @@ impl LifecycleOrchestrator {
             &format!("creating container {}", spec.name),
         );
         debug!(workspace = workspace_id, "stage=create begin");
+        let mut freshly_created = true;
         let container_id = match runtime.create(&spec).await {
             Ok(id) => id,
             // Apple's `container` CLI returns: "failed to create container
@@ -633,6 +718,7 @@ impl LifecycleOrchestrator {
                         spec.name
                     ),
                 );
+                freshly_created = false;
                 spec.name.clone()
             }
             Err(err) => return Err(stage::<()>("create", Err(err)).unwrap_err()),
@@ -673,14 +759,68 @@ impl LifecycleOrchestrator {
         // Lifecycle hooks. `initializeCommand` runs on the host (intentionally
         // not implemented in the MVP — host-side execution is gated on the
         // permission model that lands in Phase 2). The remaining hooks run
-        // inside the container via `runtime.exec`.
+        // inside the container via `runtime.exec`, split into two groups:
+        //
+        //   * "create-time" hooks (`onCreateCommand`, `updateContentCommand`,
+        //     `postCreateCommand`) run **once per container instance**. We
+        //     stamp `/var/devcontainer/postcreate_done` after they succeed
+        //     and skip them on subsequent starts (e.g., after the user
+        //     stops + starts the same container, or after we adopt an
+        //     existing container by name on app boot).
+        //   * "start-time" hooks (`postStartCommand`, `postAttachCommand`)
+        //     run on **every** start.
+        //
+        // This matches the devcontainer spec's intent: postCreateCommand
+        // is for one-time setup like `npm install`, while postStartCommand
+        // is for things that should run each time the container boots.
+        let create_hooks_already_ran = if freshly_created {
+            false
+        } else {
+            postcreate_sentinel_exists(runtime.as_ref(), &container_id)
+                .await
+                .unwrap_or(false)
+        };
+        if !create_hooks_already_ran {
+            for (label, hook) in [
+                ("onCreateCommand", parsed.on_create_command.as_ref()),
+                (
+                    "updateContentCommand",
+                    parsed.update_content_command.as_ref(),
+                ),
+                ("postCreateCommand", parsed.post_create_command.as_ref()),
+            ] {
+                if let Some(cmd) = hook {
+                    run_hook(
+                        sink,
+                        runtime.as_ref(),
+                        workspace_id,
+                        &container_id,
+                        &spec,
+                        label,
+                        cmd,
+                    )
+                    .await?;
+                }
+            }
+            // Write the sentinel even if no hooks were defined; that way
+            // we don't have to re-evaluate whether *this* config has any
+            // create-time hooks the next time around.
+            if let Err(err) = write_postcreate_sentinel(runtime.as_ref(), &container_id).await {
+                warn!(
+                    workspace = workspace_id,
+                    container = %container_id,
+                    error = %err,
+                    "failed to stamp postcreate sentinel; create-time hooks may re-run"
+                );
+            }
+        } else {
+            sink.log(
+                workspace_id,
+                LogStreamKind::System,
+                "skipping onCreate/updateContent/postCreate (already ran for this container)",
+            );
+        }
         for (label, hook) in [
-            ("onCreateCommand", parsed.on_create_command.as_ref()),
-            (
-                "updateContentCommand",
-                parsed.update_content_command.as_ref(),
-            ),
-            ("postCreateCommand", parsed.post_create_command.as_ref()),
             ("postStartCommand", parsed.post_start_command.as_ref()),
             ("postAttachCommand", parsed.post_attach_command.as_ref()),
         ] {
@@ -705,6 +845,7 @@ impl LifecycleOrchestrator {
             container_id: Some(container_id),
             image_ref: Some(spec.image.repository),
             error: None,
+            config_drift: Some(false),
         })
     }
 
@@ -941,6 +1082,67 @@ async fn ensure_runtime_ready(
     let work = runtime.ensure_system_running(Some(tx));
     let (result, ()) = tokio::join!(work, pump);
     stage("ensure_system_running", result)?;
+    Ok(())
+}
+
+/// Path of the in-container sentinel that marks "create-time hooks
+/// have run for this container instance". A regular file under `/var`
+/// is durable for the container's lifetime but does *not* persist
+/// across `remove` + `create`, which is exactly the semantics the
+/// devcontainer spec asks for: postCreate runs once per container.
+const POSTCREATE_SENTINEL: &str = "/var/devcontainer/postcreate_done";
+
+/// Probe for `POSTCREATE_SENTINEL`. Returns `Ok(true)` only when the
+/// sentinel definitely exists; any error or non-zero exit becomes
+/// `Ok(false)` so we err on the side of running the hooks again rather
+/// than silently skipping them.
+async fn postcreate_sentinel_exists(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+) -> Result<bool, ContainerRuntimeError> {
+    let opts = ExecOptions {
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("test -f {POSTCREATE_SENTINEL}"),
+        ],
+        workdir: None,
+        env: std::collections::HashMap::new(),
+        user: None,
+        tty: false,
+    };
+    match runtime.exec(container_id, &opts).await {
+        Ok(r) => Ok(r.exit_code == 0),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Write `POSTCREATE_SENTINEL` after create-time hooks succeed. We
+/// best-effort here: if the write fails (e.g., a read-only `/var`,
+/// missing `sh`) we log a warning at the call site and accept that
+/// create-time hooks may run again on the next start.
+async fn write_postcreate_sentinel(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+) -> Result<(), ContainerRuntimeError> {
+    let opts = ExecOptions {
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("mkdir -p $(dirname {POSTCREATE_SENTINEL}) && : > {POSTCREATE_SENTINEL}"),
+        ],
+        workdir: None,
+        env: std::collections::HashMap::new(),
+        user: None,
+        tty: false,
+    };
+    let result = runtime.exec(container_id, &opts).await?;
+    if result.exit_code != 0 {
+        return Err(ContainerRuntimeError::Backend(format!(
+            "failed to write postcreate sentinel (exit {})",
+            result.exit_code
+        )));
+    }
     Ok(())
 }
 

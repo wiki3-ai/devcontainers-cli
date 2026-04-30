@@ -33,6 +33,11 @@ export interface ContainerStatus {
 	containerId?: string;
 	imageRef?: string;
 	error?: string;
+	/** True when the running container's stamped config_hash label
+	 *  disagrees with the on-disk devcontainer.json (and Dockerfile, if
+	 *  any). Omitted/undefined when the host couldn't decide (no live
+	 *  container, no label, parsed config not yet submitted). */
+	configDrift?: boolean;
 }
 
 export interface RuntimeInfo {

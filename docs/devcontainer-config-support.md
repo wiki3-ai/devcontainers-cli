@@ -63,6 +63,14 @@ default has been removed.
 
 ## Lifecycle: build vs pull dispatch
 
+Before any of the steps below, `up`/`stop`/`remove` first call
+`runtime.ensure_system_running(...)`. For the Apple backend that
+translates to a `container system status` probe and, if the daemon
+isn't up, a `container system start` invocation whose log lines (
+`container system: starting…` / `container system: started`) are
+piped into the dashboard log pane. The result is cached in an
+`AtomicBool` on the runtime so subsequent calls are free.
+
 `LifecycleOrchestrator::resolve_image` decides per-workspace what to do:
 
 ```
@@ -83,6 +91,62 @@ parsed.image  →             emit "pulling" status
 After `resolve_image` returns an `ImageRef`, `to_container_spec` takes
 that ref as a parameter — image resolution and spec translation are no
 longer entangled.
+
+### Config-hash labels and cache-hit skips
+
+Every `up` computes a SHA-256 over the bytes of `devcontainer.json`
+plus, when `build:` is present, the bytes of the resolved `Dockerfile`.
+(`build.context` is intentionally **not** walked — for a desktop app the
+recursive-hash cost on a large repo isn't worth it; touch the
+Dockerfile or devcontainer.json to force a rebuild of context-only
+changes.) The hex digest is stamped onto two places:
+
+- the **image** at build time, via `container build --label
+  org.devcontainers.config_hash=<hex>`;
+- the **container** at create time, via `container create --label
+  org.devcontainers.config_hash=<hex>`.
+
+`resolve_image` uses this label to short-circuit:
+
+- For `build:` configs, `image_label(tag, LABEL_CONFIG_HASH)` is
+  consulted before invoking `container build`. If the existing image
+  carries the same hash we skip the build entirely and reuse the tag.
+- For `image:` configs, `image_exists(ref)` is consulted before
+  invoking `container image pull`. If the image is already local we
+  skip the pull.
+
+### Drift detection
+
+`container_status` calls `inspect` on the live container (when one
+exists), reads the stamped `org.devcontainers.config_hash` label off
+`configuration.labels`, recomputes the hash from disk, and compares.
+The result rides through to the WebView as
+`ContainerStatus.configDrift`:
+
+- `true` — labels disagree; dashboard shows a non-modal
+  "devcontainer.json has changed since this container was created.
+  Rebuild to apply." banner with an inline Rebuild button.
+- `false` — labels match; no banner.
+- omitted/`undefined` — undecidable (no live container, label missing
+  on an adopted container, parsed config not yet submitted). UI treats
+  this the same as `false`.
+
+Drift inspection deliberately does **not** call
+`ensure_system_running` — it's a poll, not a user action, so we don't
+want it booting the daemon as a side effect. If `inspect` fails for any
+reason drift is reported as undecidable.
+
+### Repo action buttons
+
+The per-repo header surfaces four buttons whose enablement is driven
+by the live `ContainerStatus`:
+
+| Button   | Meaning                                                                                  | Enabled when               |
+| -------- | ---------------------------------------------------------------------------------------- | -------------------------- |
+| Start    | `container_up` — pull/build if needed, create if needed, start.                          | not running, not transient |
+| Stop     | `container_stop` — leaves the container around for a future Start.                       | running                    |
+| Restart  | `container_stop` followed by `container_up` on the **same** container (no recreate).     | running                    |
+| Rebuild  | `container_remove` + `container_up` — drops the instance, rebuilds image if hash drifts. | not transient              |
 
 ### Failure surfaces
 
@@ -105,7 +169,9 @@ same events.
 | `containerEnv`, `remoteEnv`        | Forwarded as `--env KEY=VALUE`.                                       |
 | `runArgs`                          | Appended verbatim to `container run`.                                 |
 | `forwardPorts`                     | Tracked, surfaced in the UI; no automatic publish yet.                |
-| `postCreateCommand`, `postStartCommand`, `postAttachCommand`, `initializeCommand`, `onCreateCommand`, `updateContentCommand` | Run via `portable-pty`; output streamed to the log pane. |
+| `onCreateCommand`, `updateContentCommand`, `postCreateCommand` | **Create-time** hooks. Run once per container instance, in this order, immediately after the first successful create+start. We stamp `/var/devcontainer/postcreate_done` inside the container after they succeed; on subsequent starts (stop+start, or adoption-by-name on app boot) we probe that sentinel and skip these hooks if it exists. |
+| `postStartCommand`, `postAttachCommand` | **Start-time** hooks. Run on every successful start, including after a plain `Start` of an already-created container. (`postAttachCommand` currently runs alongside `postStartCommand` until a real attach surface lands.) |
+| `initializeCommand`                | Host-side hook. Not implemented in the MVP; deferred behind the Phase 2 permission model. |
 | `features`                         | Parsed but not yet installed. OCI-fetch + install layer pending.      |
 | `customizations`                   | Forwarded to the WebView; host ignores it.                            |
 | `dockerComposeFile`                | **Rejected** with an actionable error message.                        |

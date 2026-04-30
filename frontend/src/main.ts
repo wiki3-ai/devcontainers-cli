@@ -460,6 +460,8 @@ function renderDetail(): HTMLElement {
 			return main;
 		}
 		main.appendChild(renderRepoDetailHeader(ws));
+		const banner = renderDriftBanner(ws);
+		if (banner) main.appendChild(banner);
 		main.appendChild(renderStatusLine(ws.id));
 	} else {
 		const c = state.containers.find((x) => x.containerId === state.selected!.id);
@@ -485,21 +487,51 @@ function renderRepoDetailHeader(ws: WorkspaceEntry): HTMLElement {
 	title.textContent = ws.displayName;
 	header.appendChild(title);
 
+	const status = state.statuses[ws.id];
+	const live = status?.state ?? 'absent';
+	const isRunning = live === 'running';
+	const isTransient = live === 'pulling' || live === 'creating';
+	// Start: only when there's no live container. Stop: only while
+	// running. Restart: only while running (stop → up). Rebuild: always
+	// useful, and the primary remediation when drift is detected.
+	const buttons: Array<[string, () => Promise<void>, boolean]> = [
+		['Start', () => repoAction('up', ws.id), isRunning || isTransient],
+		['Stop', () => repoAction('stop', ws.id), !isRunning],
+		['Restart', () => repoAction('restart', ws.id), !isRunning],
+		['Rebuild', () => repoAction('rebuild', ws.id), isTransient],
+		['Forget', () => forgetRepo(ws.id), false],
+	];
 	const actions = document.createElement('div');
 	actions.className = 'actions';
-	for (const [label, fn] of [
-		['Up', () => repoAction('up', ws.id)],
-		['Stop', () => repoAction('stop', ws.id)],
-		['Rebuild', () => repoAction('rebuild', ws.id)],
-		['Forget', () => forgetRepo(ws.id)],
-	] as const) {
+	for (const [label, fn, disabled] of buttons) {
 		const btn = document.createElement('button');
 		btn.textContent = label;
+		btn.disabled = disabled;
 		btn.addEventListener('click', () => void fn());
 		actions.appendChild(btn);
 	}
 	header.appendChild(actions);
 	return header;
+}
+
+/** Non-modal banner shown above the status line when the host has
+ *  detected that on-disk devcontainer.json/Dockerfile no longer match
+ *  the labels stamped on the live container. */
+function renderDriftBanner(ws: WorkspaceEntry): HTMLElement | null {
+	const s = state.statuses[ws.id];
+	if (!s || s.configDrift !== true) return null;
+	const banner = document.createElement('div');
+	banner.className = 'drift-banner';
+	banner.setAttribute('role', 'status');
+	const text = document.createElement('span');
+	text.textContent =
+		'devcontainer.json has changed since this container was created. Rebuild to apply.';
+	banner.appendChild(text);
+	const btn = document.createElement('button');
+	btn.textContent = 'Rebuild';
+	btn.addEventListener('click', () => void repoAction('rebuild', ws.id));
+	banner.appendChild(btn);
+	return banner;
 }
 
 function renderContainerDetailHeader(c: ContainerEntry): HTMLElement {
@@ -691,7 +723,7 @@ async function onOpenFolder(): Promise<void> {
 	}
 }
 
-type RepoAction = 'up' | 'stop' | 'rebuild';
+type RepoAction = 'up' | 'stop' | 'rebuild' | 'restart';
 
 async function repoAction(kind: RepoAction, workspaceId: string): Promise<void> {
 	const key = logKeyForWorkspace(workspaceId);
@@ -708,12 +740,21 @@ async function repoAction(kind: RepoAction, workspaceId: string): Promise<void> 
 		}
 	}
 	try {
-		const fn = {
-			up: bridge.container_up,
-			stop: bridge.container_stop,
-			rebuild: bridge.container_rebuild,
-		}[kind];
-		const status = await fn(workspaceId);
+		let status: ContainerStatus;
+		if (kind === 'restart') {
+			// Stop, then bring up: a true restart of the same instance.
+			// We deliberately do not Rebuild here — Rebuild is a separate
+			// button for the destructive recreate-from-image path.
+			await bridge.container_stop(workspaceId);
+			status = await bridge.container_up(workspaceId);
+		} else {
+			const fn = {
+				up: bridge.container_up,
+				stop: bridge.container_stop,
+				rebuild: bridge.container_rebuild,
+			}[kind];
+			status = await fn(workspaceId);
+		}
 		state.statuses[workspaceId] = status;
 	} catch (err) {
 		const msg = errMsg(err);
