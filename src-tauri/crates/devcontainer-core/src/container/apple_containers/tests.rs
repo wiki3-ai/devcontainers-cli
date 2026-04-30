@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::cli::{
-    build_args_with_dns, create_args, dns_list_contains, exec_args, image_label_from_inspect,
-    image_list_contains, image_ref_to_string, logs_args, parse_inspect, parse_list,
-    parse_resolver_localhost_ip, pull_args, remove_args, system_status_is_running,
+    build_args_with_dns, create_args, exec_args, image_label_from_inspect, image_list_contains,
+    image_ref_to_string, logs_args, parse_inspect, parse_list, pull_args, remove_args,
+    system_status_is_running,
 };
 use crate::container::traits::{
     BuildSpec, ContainerSpec, ContainerState, ExecOptions, ImageRef, LogOptions, MountKind,
@@ -374,54 +374,6 @@ fn image_list_contains_matches_implicit_docker_io_prefix() {
     assert!(image_list_contains(stdout, "library/alpine:3.19"));
     assert!(image_list_contains(stdout, "docker.io/library/alpine:3.19"));
     assert!(!image_list_contains(stdout, "library/busybox:latest"));
-}
-
-#[test]
-fn dns_list_contains_matches_first_column() {
-    // `container system dns ls` prints a header row plus zero or more
-    // domain rows. Match must be on the first whitespace-separated
-    // token so that a substring of e.g. a description column does not
-    // produce a false positive.
-    let stdout = "DOMAIN\nhost.docker.internal\nfoo.test\n";
-    assert!(dns_list_contains(stdout, "host.docker.internal"));
-    assert!(dns_list_contains(stdout, "HOST.DOCKER.INTERNAL"));
-    assert!(!dns_list_contains(stdout, "docker.internal"));
-    assert!(!dns_list_contains("DOMAIN\n", "host.docker.internal"));
-    assert!(!dns_list_contains("", "host.docker.internal"));
-}
-
-#[test]
-fn parse_resolver_localhost_ip_extracts_ip_from_options() {
-    // Real /etc/resolver/containerization.host.docker.internal as
-    // written by `container system dns create`.
-    let contents = "domain host.docker.internal\n\
-         search host.docker.internal\n\
-         nameserver 127.0.0.1\n\
-         port 1053\n\
-         options localhost:192.168.64.1\n";
-    assert_eq!(
-        parse_resolver_localhost_ip(contents),
-        Some("192.168.64.1".to_string())
-    );
-    // Stale registration with a different IP must be detected so the
-    // backend can re-register at the expected address.
-    let stale = "options localhost:203.0.113.113\n";
-    assert_eq!(
-        parse_resolver_localhost_ip(stale),
-        Some("203.0.113.113".to_string())
-    );
-    // Multiple options tokens; only the `localhost:` one matters.
-    let multi = "options ndots:0 localhost:10.0.0.1 timeout:1\n";
-    assert_eq!(
-        parse_resolver_localhost_ip(multi),
-        Some("10.0.0.1".to_string())
-    );
-    // No options line at all -> None.
-    assert_eq!(
-        parse_resolver_localhost_ip("domain x\nnameserver 1.1.1.1\n"),
-        None
-    );
-    assert_eq!(parse_resolver_localhost_ip(""), None);
 }
 
 #[test]

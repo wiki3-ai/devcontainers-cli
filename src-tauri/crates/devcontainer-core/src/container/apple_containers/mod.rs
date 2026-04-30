@@ -48,11 +48,6 @@ pub struct AppleContainersRuntime {
     /// the same process. We never reset this — if the daemon dies mid-
     /// session the next CLI call surfaces the failure on its own.
     system_ready: AtomicBool,
-    /// Set once we've decided whether `host.docker.internal` is
-    /// registered as a localhost-redirect DNS domain (or attempted to
-    /// register it). Stays set even on failure so we don't pop the
-    /// `osascript` admin prompt repeatedly in the same process.
-    host_internal_dns_checked: AtomicBool,
 }
 
 impl Clone for AppleContainersRuntime {
@@ -60,9 +55,6 @@ impl Clone for AppleContainersRuntime {
         Self {
             cli: self.cli.clone(),
             system_ready: AtomicBool::new(self.system_ready.load(Ordering::Relaxed)),
-            host_internal_dns_checked: AtomicBool::new(
-                self.host_internal_dns_checked.load(Ordering::Relaxed),
-            ),
         }
     }
 }
@@ -78,7 +70,6 @@ impl AppleContainersRuntime {
         Self {
             cli: ContainerCli::default(),
             system_ready: AtomicBool::new(false),
-            host_internal_dns_checked: AtomicBool::new(false),
         }
     }
 
@@ -86,239 +77,7 @@ impl AppleContainersRuntime {
         Self {
             cli: ContainerCli::new(binary),
             system_ready: AtomicBool::new(false),
-            host_internal_dns_checked: AtomicBool::new(false),
         }
-    }
-
-    /// Ensure that `host.docker.internal` resolves to a fixed IP that
-    /// Apple's `container` runtime redirects back to `127.0.0.1` on the
-    /// host. This mirrors Docker Desktop's well-known hostname so apps
-    /// that already use it work unchanged.
-    ///
-    /// Apple's mechanism is system-wide and requires root: `container
-    /// system dns create <domain> --localhost <ip>` writes a scoped
-    /// resolver under `/etc/resolver/<domain>` and reloads
-    /// mDNSResponder + the packet filter. We surface a single
-    /// `osascript` auth prompt for that step; if anything fails we log
-    /// a warning and proceed — every other CLI op stays functional.
-    ///
-    /// Idempotent and best-effort: the `host_internal_dns_checked`
-    /// flag prevents repeated prompts within a single process.
-    async fn ensure_host_internal_dns(&self, log_sink: Option<&mpsc::Sender<LogChunk>>) {
-        if self.host_internal_dns_checked.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        const DOMAIN: &str = "host.docker.internal";
-        // Apple Containers' default bridge gateway IP. Mapping
-        // `host.docker.internal` directly at the gateway gives a real,
-        // routable path to host services from inside a container with
-        // no dependency on Apple's PF redirect rule (which is fragile
-        // — it's absent entirely when the `container-network` plugin
-        // isn't installed). Build sandboxes still don't consult the
-        // host's resolver, so build-time URL rewriting (see
-        // `merge_proxy_build_args`) targets the same IP as a literal.
-        const REDIRECT_IP: &str = "192.168.64.1";
-        // `container system dns create <domain>` writes its scoped
-        // resolver to `/etc/resolver/containerization.<domain>`. The
-        // file is world-readable and records the redirect IP as
-        // `options localhost:<ip>`, which lets us verify the recorded
-        // address rather than blindly trusting the domain registration.
-        let resolver_path = format!("/etc/resolver/containerization.{DOMAIN}");
-
-        // Determine current state. We treat the resolver file as
-        // authoritative for the recorded IP because the CLI's `dns
-        // ls` does not surface it. If the file is unreadable for any
-        // reason (missing, perms changed) we fall back to `dns ls`
-        // and, on positive match without a verifiable IP, conservatively
-        // re-register so the user ends up with the IP we expect.
-        let recorded_ip = tokio::fs::read_to_string(&resolver_path)
-            .await
-            .ok()
-            .and_then(|s| cli::parse_resolver_localhost_ip(&s));
-        let domain_listed = match run_capturing(&self.cli, ["system", "dns", "ls"]).await {
-            Ok((stdout, _)) => cli::dns_list_contains(&stdout, DOMAIN),
-            Err(_) => false,
-        };
-
-        match (&recorded_ip, domain_listed) {
-            (Some(ip), true) if ip == REDIRECT_IP => {
-                debug!(
-                    domain = DOMAIN,
-                    ip = %ip,
-                    "host-internal DNS already registered at expected IP"
-                );
-                return;
-            }
-            (Some(ip), _) => {
-                // Domain registered but at a different IP. Surface the
-                // drift so the user understands why we're prompting.
-                if let Some(sink) = log_sink {
-                    let _ = sink
-                        .send(LogChunk {
-                            stream: LogStreamKind::System,
-                            line: format!(
-                                "`{DOMAIN}` registered at {ip}, expected {REDIRECT_IP}; re-registering (one-time admin prompt)"
-                            ),
-                        })
-                        .await;
-                }
-            }
-            (None, true) => {
-                // Domain present per the CLI but resolver file
-                // unreadable. Conservatively re-register.
-                if let Some(sink) = log_sink {
-                    let _ = sink
-                        .send(LogChunk {
-                            stream: LogStreamKind::System,
-                            line: format!(
-                                "`{DOMAIN}` registration found but unable to verify recorded IP; re-registering (one-time admin prompt)"
-                            ),
-                        })
-                        .await;
-                }
-            }
-            (None, false) => {
-                if let Some(sink) = log_sink {
-                    let _ = sink
-                        .send(LogChunk {
-                            stream: LogStreamKind::System,
-                            line: format!(
-                                "registering `{DOMAIN}` -> {REDIRECT_IP} (one-time admin prompt)"
-                            ),
-                        })
-                        .await;
-                }
-            }
-        }
-        let needs_delete_first = recorded_ip.is_some() || domain_listed;
-
-        // Apple's `container system dns create` requires admin privs
-        // because it writes to `/etc/resolver/` and reloads
-        // mDNSResponder. Use macOS's `osascript ... with administrator
-        // privileges` to surface the standard auth dialog. Resolve the
-        // binary to an absolute path first because the GUI auth shell
-        // does not inherit the user's `$PATH`.
-        let binary = self.cli.binary().to_string();
-        let resolved = match resolve_absolute_binary(&binary) {
-            Some(p) => p,
-            None => {
-                let msg = format!(
-                    "could not resolve absolute path for `{binary}`; skipping host.docker.internal registration"
-                );
-                warn!("{msg}");
-                if let Some(sink) = log_sink {
-                    let _ = sink
-                        .send(LogChunk {
-                            stream: LogStreamKind::System,
-                            line: msg,
-                        })
-                        .await;
-                }
-                return;
-            }
-        };
-
-        // Build the inner shell command. The arguments are fixed and
-        // we constructed them ourselves (no user input) so quoting is
-        // straightforward. When the domain is already registered (at
-        // the wrong IP, or with an unverifiable resolver file) we
-        // delete it first so `create` does not fail with `domain
-        // already exists`. The `delete` is best-effort: `|| true`
-        // swallows the missing-domain case and the wrapper still
-        // passes only when `create` succeeds.
-        let create_cmd = format!("{resolved} system dns create {DOMAIN} --localhost {REDIRECT_IP}");
-        let inner = if needs_delete_first {
-            format!("{resolved} system dns delete {DOMAIN} >/dev/null 2>&1 || true; {create_cmd}")
-        } else {
-            create_cmd.clone()
-        };
-        // AppleScript single-quotes the command literal; we just need
-        // to escape any embedded double quotes (there are none in the
-        // current form, but be defensive in case `resolved` contains
-        // something like a Homebrew prefix with spaces — rare but
-        // possible on customised installs).
-        let inner_escaped = inner.replace('\\', "\\\\").replace('"', "\\\"");
-        let osa = format!("do shell script \"{inner_escaped}\" with administrator privileges");
-
-        let result = tokio::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&osa)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
-
-        match result {
-            Ok(out) if out.status.success() => {
-                let line = format!("registered `{DOMAIN}` -> {REDIRECT_IP}");
-                info!("{line}");
-                if let Some(sink) = log_sink {
-                    let _ = sink
-                        .send(LogChunk {
-                            stream: LogStreamKind::System,
-                            line,
-                        })
-                        .await;
-                }
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let line = format!(
-                    "could not register `{DOMAIN}` (exit {}): {}; host-service access via that hostname will not work until `sudo {}` runs",
-                    out.status.code().unwrap_or(-1),
-                    stderr.trim(),
-                    create_cmd
-                );
-                warn!("{line}");
-                if let Some(sink) = log_sink {
-                    let _ = sink
-                        .send(LogChunk {
-                            stream: LogStreamKind::System,
-                            line,
-                        })
-                        .await;
-                }
-            }
-            Err(e) => {
-                let line = format!("could not invoke osascript to register `{DOMAIN}`: {e}");
-                warn!("{line}");
-                if let Some(sink) = log_sink {
-                    let _ = sink
-                        .send(LogChunk {
-                            stream: LogStreamKind::System,
-                            line,
-                        })
-                        .await;
-                }
-            }
-        }
-    }
-}
-
-/// Resolve `name` to an absolute path by consulting `which` in the
-/// running process's `$PATH`. Returns `None` if the binary is not on
-/// `$PATH` or `which` fails. Used by [`AppleContainersRuntime::
-/// ensure_host_internal_dns`] because the GUI shell launched by
-/// `osascript … with administrator privileges` does not inherit our
-/// `$PATH` and can't find Homebrew-installed tools by bare name.
-fn resolve_absolute_binary(name: &str) -> Option<String> {
-    if std::path::Path::new(name).is_absolute() {
-        return Some(name.to_string());
-    }
-    let out = std::process::Command::new("/usr/bin/which")
-        .arg(name)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?;
-    let path = s.trim();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.to_string())
     }
 }
 
@@ -366,11 +125,6 @@ impl ContainerRuntime for AppleContainersRuntime {
         log_sink: Option<mpsc::Sender<LogChunk>>,
     ) -> Result<(), ContainerRuntimeError> {
         if self.system_ready.load(Ordering::Relaxed) {
-            // Already up in this process — but still make sure the
-            // `host.docker.internal` DNS domain registration has been
-            // attempted at least once. The helper short-circuits on its
-            // own atomic flag so we don't keep re-prompting.
-            self.ensure_host_internal_dns(log_sink.as_ref()).await;
             return Ok(());
         }
         // `container system status` is the cheapest probe: it prints a
@@ -384,7 +138,6 @@ impl ContainerRuntime for AppleContainersRuntime {
         };
         if cli::system_status_is_running(&status_text) {
             self.system_ready.store(true, Ordering::Relaxed);
-            self.ensure_host_internal_dns(log_sink.as_ref()).await;
             return Ok(());
         }
         if let Some(sink) = &log_sink {
@@ -406,15 +159,6 @@ impl ContainerRuntime for AppleContainersRuntime {
                 .await;
         }
         self.system_ready.store(true, Ordering::Relaxed);
-        // Best-effort: register the `host.docker.internal` DNS domain
-        // so containers can reach host services on `127.0.0.1`. This
-        // requires admin privileges (the underlying `container system
-        // dns create` writes to `/etc/resolver/` and reloads
-        // mDNSResponder), so we use osascript to surface a single
-        // GUI auth prompt. If it fails or the user cancels we log a
-        // warning and continue — host networking still works for
-        // every other purpose.
-        self.ensure_host_internal_dns(log_sink.as_ref()).await;
         Ok(())
     }
 

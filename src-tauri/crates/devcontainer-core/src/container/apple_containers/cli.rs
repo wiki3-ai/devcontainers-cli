@@ -403,46 +403,6 @@ pub(crate) fn image_list_contains(stdout: &str, needle: &str) -> bool {
     })
 }
 
-/// Whether `container system dns ls` mentions `domain` somewhere in its
-/// output. The CLI emits a small text table whose first column is the
-/// domain name; we don't need to fully parse it because the domain
-/// strings we care about (`host.docker.internal`) are unique enough to
-/// match by substring without false positives.
-pub(crate) fn dns_list_contains(stdout: &str, domain: &str) -> bool {
-    stdout.lines().any(|line| {
-        line.split_whitespace()
-            .next()
-            .map(|first| first.eq_ignore_ascii_case(domain))
-            .unwrap_or(false)
-    })
-}
-
-/// Parse the localhost-redirect IP recorded in an `/etc/resolver/`
-/// file written by `container system dns create <domain> --localhost
-/// <ip>`. The file format is a small set of `key value` lines; the IP
-/// lives on a line of the form `options localhost:<ip>`. Returns
-/// `None` if the marker line is absent or malformed.
-pub(crate) fn parse_resolver_localhost_ip(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        let line = line.trim();
-        let rest = match line.strip_prefix("options") {
-            Some(r) => r.trim(),
-            None => continue,
-        };
-        // `options` may carry multiple space-separated entries; find
-        // the one starting with `localhost:`.
-        for token in rest.split_whitespace() {
-            if let Some(ip) = token.strip_prefix("localhost:") {
-                let ip = ip.trim();
-                if !ip.is_empty() {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Read a config-time label from `container image inspect <ref>` output.
 /// Apple's CLI returns an array of image entries, each with one or more
 /// `variants[].config.config.Labels` maps. We scan all variants so a
