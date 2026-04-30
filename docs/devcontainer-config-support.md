@@ -85,9 +85,13 @@ where containers consume them:
   Apple Containers' default bridge gateway. The build sandbox does
   not consult the host resolver, so a literal IP is the only
   reliable option.
-- **Container env vars** can use the same address at runtime; from
-  inside a container `192.168.64.1` reaches services bound on the
-  host's bridge interface (or `0.0.0.0`).
+- **Container env vars** get the same treatment at runtime: `up_inner`
+  re-runs `merge_proxy_build_args` against `spec.env` so the standard
+  proxy vars are forwarded into the running container (with loopback
+  rewritten to `192.168.64.1`). Explicit entries in `containerEnv` /
+  `remoteEnv` always win. From inside a container, `192.168.64.1`
+  reaches services bound on the host's bridge interface (or
+  `0.0.0.0`).
 
 If you need `host.docker.internal` *inside* a container you can still
 register it manually with `sudo container system dns create

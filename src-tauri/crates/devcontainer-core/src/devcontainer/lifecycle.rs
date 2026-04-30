@@ -802,6 +802,14 @@ impl LifecycleOrchestrator {
             )
             .await?;
         let mut spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
+        // Forward host proxy env vars into the container so that
+        // lifecycle hooks (e.g. `postCreateCommand: pip install ...`)
+        // can reach the network through a host-side proxy. Reuses the
+        // same loopback→bridge-gateway rewrite as the build path so
+        // `http://localhost:3128` on the host becomes
+        // `http://192.168.64.1:3128` inside the container. Explicit
+        // entries in `containerEnv`/`remoteEnv` win.
+        spec.env = merge_proxy_build_args(spec.env, |n| std::env::var(n).ok());
         if let Some(h) = config_hash.as_deref() {
             spec.labels
                 .insert(LABEL_CONFIG_HASH.to_string(), h.to_string());
