@@ -169,6 +169,16 @@ const PROXY_VAR_NAMES: &[&str] = &[
     "ALL_PROXY",
 ];
 
+/// IPv4 of the Apple Containers default bridge gateway. Loopback
+/// proxy URLs are rewritten to use this literal IP rather than a
+/// hostname because `container build`'s sandbox does not pick up the
+/// `container system dns create` registration: that mechanism only
+/// configures the host's `mDNSResponder`, not the build VM's
+/// `/etc/resolv.conf`. Using the gateway IP directly sidesteps DNS
+/// entirely. Apple's `container` runtime hard-codes `192.168.64.0/24`
+/// for the default bridge with `.1` as the gateway.
+const HOST_BRIDGE_GATEWAY_IP: &str = "192.168.64.1";
+
 /// Merge proxy environment variables (HTTP_PROXY etc.) into a
 /// build-args map. Each name is looked up via `lookup` in both upper-
 /// and lower-case forms; the first non-empty value wins. Existing
@@ -176,12 +186,11 @@ const PROXY_VAR_NAMES: &[&str] = &[
 /// take precedence over the host environment.
 ///
 /// Host literals of `localhost`, `127.0.0.1`, and `::1` in the URL
-/// are rewritten to `host.docker.internal` so a host-side proxy
-/// reachable on the loopback interface can be reached from inside
-/// the build container. (devcontainer-core's Apple Containers
-/// backend registers `host.docker.internal` as a localhost-redirect
-/// DNS entry; on Docker Desktop / Podman it is provided by the
-/// runtime.)
+/// are rewritten to the Apple Containers bridge gateway IP
+/// (`192.168.64.1`) so a host-side proxy reachable on the loopback
+/// interface can be reached from inside the build container without
+/// depending on DNS — `container build` does not pick up the
+/// `host.docker.internal` registration.
 pub(crate) fn merge_proxy_build_args<F>(
     mut args: HashMap<String, String>,
     mut lookup: F,
@@ -199,7 +208,7 @@ where
         if let Some(value) = value {
             args.insert(
                 (*name).to_string(),
-                rewrite_localhost_to_host_internal(&value),
+                rewrite_localhost_to_host_gateway(&value),
             );
         }
     }
@@ -207,8 +216,8 @@ where
 }
 
 /// Rewrite `localhost` / `127.0.0.1` / `::1` host components in a
-/// proxy URL to `host.docker.internal`. See [`merge_proxy_build_args`].
-fn rewrite_localhost_to_host_internal(url: &str) -> String {
+/// proxy URL to the bridge gateway IP. See [`merge_proxy_build_args`].
+fn rewrite_localhost_to_host_gateway(url: &str) -> String {
     let mut out = String::with_capacity(url.len() + 16);
     let bytes = url.as_bytes();
     let mut i = 0;
@@ -231,7 +240,7 @@ fn rewrite_localhost_to_host_internal(url: &str) -> String {
         }
         let host = &url[host_start..host_end];
         let rewritten = match host.to_ascii_lowercase().as_str() {
-            "localhost" | "127.0.0.1" | "[::1]" | "::1" => "host.docker.internal",
+            "localhost" | "127.0.0.1" | "[::1]" | "::1" => HOST_BRIDGE_GATEWAY_IP,
             _ => host,
         };
         out.push_str(rewritten);
@@ -1319,11 +1328,11 @@ mod tests {
         let merged = merge_proxy_build_args(HashMap::new(), env);
         assert_eq!(
             merged.get("HTTPS_PROXY").map(String::as_str),
-            Some("http://host.docker.internal:3128")
+            Some("http://192.168.64.1:3128")
         );
         assert_eq!(
             merged.get("HTTP_PROXY").map(String::as_str),
-            Some("http://host.docker.internal:3128")
+            Some("http://192.168.64.1:3128")
         );
         // NO_PROXY is a comma-separated list, not a URL — left as-is.
         assert_eq!(
@@ -1355,11 +1364,11 @@ mod tests {
     #[test]
     fn rewrite_localhost_handles_userinfo_and_paths() {
         assert_eq!(
-            rewrite_localhost_to_host_internal("http://user:pass@localhost:3128/path?q=1"),
-            "http://user:pass@host.docker.internal:3128/path?q=1"
+            rewrite_localhost_to_host_gateway("http://user:pass@localhost:3128/path?q=1"),
+            "http://user:pass@192.168.64.1:3128/path?q=1"
         );
         assert_eq!(
-            rewrite_localhost_to_host_internal("http://proxy.corp:8080"),
+            rewrite_localhost_to_host_gateway("http://proxy.corp:8080"),
             "http://proxy.corp:8080"
         );
     }

@@ -417,6 +417,32 @@ pub(crate) fn dns_list_contains(stdout: &str, domain: &str) -> bool {
     })
 }
 
+/// Parse the localhost-redirect IP recorded in an `/etc/resolver/`
+/// file written by `container system dns create <domain> --localhost
+/// <ip>`. The file format is a small set of `key value` lines; the IP
+/// lives on a line of the form `options localhost:<ip>`. Returns
+/// `None` if the marker line is absent or malformed.
+pub(crate) fn parse_resolver_localhost_ip(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        let rest = match line.strip_prefix("options") {
+            Some(r) => r.trim(),
+            None => continue,
+        };
+        // `options` may carry multiple space-separated entries; find
+        // the one starting with `localhost:`.
+        for token in rest.split_whitespace() {
+            if let Some(ip) = token.strip_prefix("localhost:") {
+                let ip = ip.trim();
+                if !ip.is_empty() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Read a config-time label from `container image inspect <ref>` output.
 /// Apple's CLI returns an array of image entries, each with one or more
 /// `variants[].config.config.Labels` maps. We scan all variants so a

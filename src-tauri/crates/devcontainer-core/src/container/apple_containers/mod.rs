@@ -109,33 +109,88 @@ impl AppleContainersRuntime {
             return;
         }
         const DOMAIN: &str = "host.docker.internal";
-        // Documentation-range IP (RFC 5737 TEST-NET-3). Won't collide
-        // with any real network and will never be routable, so when
-        // Apple's packet filter rule isn't in place the failure is
-        // immediate rather than mysteriously timing out.
-        const REDIRECT_IP: &str = "203.0.113.113";
+        // Apple Containers' default bridge gateway IP. Mapping
+        // `host.docker.internal` directly at the gateway gives a real,
+        // routable path to host services from inside a container with
+        // no dependency on Apple's PF redirect rule (which is fragile
+        // — it's absent entirely when the `container-network` plugin
+        // isn't installed). Build sandboxes still don't consult the
+        // host's resolver, so build-time URL rewriting (see
+        // `merge_proxy_build_args`) targets the same IP as a literal.
+        const REDIRECT_IP: &str = "192.168.64.1";
+        // `container system dns create <domain>` writes its scoped
+        // resolver to `/etc/resolver/containerization.<domain>`. The
+        // file is world-readable and records the redirect IP as
+        // `options localhost:<ip>`, which lets us verify the recorded
+        // address rather than blindly trusting the domain registration.
+        let resolver_path = format!("/etc/resolver/containerization.{DOMAIN}");
 
-        // Cheap pre-check: `dns ls` does not require sudo. Skip the
-        // prompt entirely if the entry is already there.
-        let already_registered = match run_capturing(&self.cli, ["system", "dns", "ls"]).await {
+        // Determine current state. We treat the resolver file as
+        // authoritative for the recorded IP because the CLI's `dns
+        // ls` does not surface it. If the file is unreadable for any
+        // reason (missing, perms changed) we fall back to `dns ls`
+        // and, on positive match without a verifiable IP, conservatively
+        // re-register so the user ends up with the IP we expect.
+        let recorded_ip = tokio::fs::read_to_string(&resolver_path)
+            .await
+            .ok()
+            .and_then(|s| cli::parse_resolver_localhost_ip(&s));
+        let domain_listed = match run_capturing(&self.cli, ["system", "dns", "ls"]).await {
             Ok((stdout, _)) => cli::dns_list_contains(&stdout, DOMAIN),
             Err(_) => false,
         };
-        if already_registered {
-            debug!(domain = DOMAIN, "host-internal DNS already registered");
-            return;
-        }
 
-        if let Some(sink) = log_sink {
-            let _ = sink
-                .send(LogChunk {
-                    stream: LogStreamKind::System,
-                    line: format!(
-                        "registering `{DOMAIN}` -> {REDIRECT_IP} (one-time admin prompt)"
-                    ),
-                })
-                .await;
+        match (&recorded_ip, domain_listed) {
+            (Some(ip), true) if ip == REDIRECT_IP => {
+                debug!(
+                    domain = DOMAIN,
+                    ip = %ip,
+                    "host-internal DNS already registered at expected IP"
+                );
+                return;
+            }
+            (Some(ip), _) => {
+                // Domain registered but at a different IP. Surface the
+                // drift so the user understands why we're prompting.
+                if let Some(sink) = log_sink {
+                    let _ = sink
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line: format!(
+                                "`{DOMAIN}` registered at {ip}, expected {REDIRECT_IP}; re-registering (one-time admin prompt)"
+                            ),
+                        })
+                        .await;
+                }
+            }
+            (None, true) => {
+                // Domain present per the CLI but resolver file
+                // unreadable. Conservatively re-register.
+                if let Some(sink) = log_sink {
+                    let _ = sink
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line: format!(
+                                "`{DOMAIN}` registration found but unable to verify recorded IP; re-registering (one-time admin prompt)"
+                            ),
+                        })
+                        .await;
+                }
+            }
+            (None, false) => {
+                if let Some(sink) = log_sink {
+                    let _ = sink
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line: format!(
+                                "registering `{DOMAIN}` -> {REDIRECT_IP} (one-time admin prompt)"
+                            ),
+                        })
+                        .await;
+                }
+            }
         }
+        let needs_delete_first = recorded_ip.is_some() || domain_listed;
 
         // Apple's `container system dns create` requires admin privs
         // because it writes to `/etc/resolver/` and reloads
@@ -165,8 +220,18 @@ impl AppleContainersRuntime {
 
         // Build the inner shell command. The arguments are fixed and
         // we constructed them ourselves (no user input) so quoting is
-        // straightforward.
-        let inner = format!("{resolved} system dns create {DOMAIN} --localhost {REDIRECT_IP}");
+        // straightforward. When the domain is already registered (at
+        // the wrong IP, or with an unverifiable resolver file) we
+        // delete it first so `create` does not fail with `domain
+        // already exists`. The `delete` is best-effort: `|| true`
+        // swallows the missing-domain case and the wrapper still
+        // passes only when `create` succeeds.
+        let create_cmd = format!("{resolved} system dns create {DOMAIN} --localhost {REDIRECT_IP}");
+        let inner = if needs_delete_first {
+            format!("{resolved} system dns delete {DOMAIN} >/dev/null 2>&1 || true; {create_cmd}")
+        } else {
+            create_cmd.clone()
+        };
         // AppleScript single-quotes the command literal; we just need
         // to escape any embedded double quotes (there are none in the
         // current form, but be defensive in case `resolved` contains
@@ -203,7 +268,7 @@ impl AppleContainersRuntime {
                     "could not register `{DOMAIN}` (exit {}): {}; host-service access via that hostname will not work until `sudo {}` runs",
                     out.status.code().unwrap_or(-1),
                     stderr.trim(),
-                    inner
+                    create_cmd
                 );
                 warn!("{line}");
                 if let Some(sink) = log_sink {

@@ -83,11 +83,21 @@ back to `127.0.0.1` on the host. The backend:
 1. runs `container system dns ls` (no privilege required) and skips
    out if `host.docker.internal` is already there;
 2. otherwise shells out via `osascript -e 'do shell script "<container>
-   system dns create host.docker.internal --localhost 203.0.113.113"
+   system dns create host.docker.internal --localhost 192.168.64.1"
    with administrator privileges'`, surfacing the standard macOS auth
-   dialog exactly once. The redirect IP is `203.0.113.113` from the
-   RFC 5737 documentation range so it cannot collide with real
-   networks.
+   dialog exactly once. The redirect IP is `192.168.64.1`, the Apple
+   Containers default bridge gateway: traffic to the gateway already
+   reaches host services, so this works without depending on Apple's
+   PF redirect rule (which is absent when the optional
+   `container-network` plugin isn't installed).
+
+   **Note on build sandboxes.** `container build`'s sandbox does not
+   consult the host resolver, so `host.docker.internal` won't resolve
+   from inside RUN steps. For build-time URLs (e.g. `HTTPS_PROXY`)
+   the lifecycle's [`merge_proxy_build_args`](../src-tauri/crates/devcontainer-core/src/devcontainer/lifecycle.rs)
+   rewrites loopback host literals (`localhost`, `127.0.0.1`, `::1`)
+   directly to the same `192.168.64.1` literal so build-time proxy
+   access works without DNS.
 
 The registration persists across host reboots until the user runs
 `sudo container system dns delete host.docker.internal`. If the user
