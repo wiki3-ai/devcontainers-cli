@@ -100,10 +100,7 @@ impl AppleContainersRuntime {
     /// Idempotent and best-effort: the `host_internal_dns_checked`
     /// flag prevents repeated prompts within a single process.
     async fn ensure_host_internal_dns(&self, log_sink: Option<&mpsc::Sender<LogChunk>>) {
-        if self
-            .host_internal_dns_checked
-            .swap(true, Ordering::Relaxed)
-        {
+        if self.host_internal_dns_checked.swap(true, Ordering::Relaxed) {
             return;
         }
         const DOMAIN: &str = "host.docker.internal";
@@ -164,17 +161,14 @@ impl AppleContainersRuntime {
         // Build the inner shell command. The arguments are fixed and
         // we constructed them ourselves (no user input) so quoting is
         // straightforward.
-        let inner =
-            format!("{resolved} system dns create {DOMAIN} --localhost {REDIRECT_IP}");
+        let inner = format!("{resolved} system dns create {DOMAIN} --localhost {REDIRECT_IP}");
         // AppleScript single-quotes the command literal; we just need
         // to escape any embedded double quotes (there are none in the
         // current form, but be defensive in case `resolved` contains
         // something like a Homebrew prefix with spaces — rare but
         // possible on customised installs).
         let inner_escaped = inner.replace('\\', "\\\\").replace('"', "\\\"");
-        let osa = format!(
-            "do shell script \"{inner_escaped}\" with administrator privileges"
-        );
+        let osa = format!("do shell script \"{inner_escaped}\" with administrator privileges");
 
         let result = tokio::process::Command::new("osascript")
             .arg("-e")
@@ -370,14 +364,13 @@ impl ContainerRuntime for AppleContainersRuntime {
         key: &str,
     ) -> Result<Option<String>, ContainerRuntimeError> {
         let needle = cli::image_ref_to_string(image);
-        let (stdout, _) =
-            match run_capturing(&self.cli, ["image", "inspect", &needle]).await {
-                Ok(p) => p,
-                // Apple returns a non-zero exit when the image is absent;
-                // surface that as `Ok(None)` rather than a hard error so
-                // callers can treat "absent" and "label missing" the same.
-                Err(_) => return Ok(None),
-            };
+        let (stdout, _) = match run_capturing(&self.cli, ["image", "inspect", &needle]).await {
+            Ok(p) => p,
+            // Apple returns a non-zero exit when the image is absent;
+            // surface that as `Ok(None)` rather than a hard error so
+            // callers can treat "absent" and "label missing" the same.
+            Err(_) => return Ok(None),
+        };
         Ok(cli::image_label_from_inspect(&stdout, key))
     }
 

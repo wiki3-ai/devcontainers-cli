@@ -341,7 +341,10 @@ async fn real_container_labels_round_trip_on_inspect() {
 
     let status = rt.inspect(&cid).await.expect("inspect");
     assert_eq!(
-        status.labels.get("org.devcontainers.config_hash").map(String::as_str),
+        status
+            .labels
+            .get("org.devcontainers.config_hash")
+            .map(String::as_str),
         Some("deadbeef"),
         "config_hash label must round-trip; got labels={:?}",
         status.labels,

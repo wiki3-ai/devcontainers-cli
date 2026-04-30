@@ -10,9 +10,8 @@ use std::path::PathBuf;
 
 use super::cli::{
     build_args_with_dns, create_args, dns_list_contains, exec_args, image_label_from_inspect,
-    image_list_contains,
-    image_ref_to_string, logs_args, parse_inspect, parse_list, pull_args, remove_args,
-    system_status_is_running,
+    image_list_contains, image_ref_to_string, logs_args, parse_inspect, parse_list, pull_args,
+    remove_args, system_status_is_running,
 };
 use crate::container::traits::{
     BuildSpec, ContainerSpec, ContainerState, ExecOptions, ImageRef, LogOptions, MountKind,

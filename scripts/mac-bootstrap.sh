@@ -26,4 +26,7 @@ yarn --cwd frontend install "${YARN_FLAGS[@]}"
 log "deno task build (engine bundle → dist/devcontainer-engine.js)"
 deno task build
 
+log "install git hooks (rustfmt pre-commit)"
+scripts/install-git-hooks.sh
+
 log "Done. Next: scripts/mac-dev.sh (dev) or scripts/mac-build.sh (release .app)"

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# pre-commit — block commits that would fail CI's `cargo fmt --check`.
+#
+# Installed by scripts/install-git-hooks.sh, which is invoked from
+# scripts/mac-bootstrap.sh. To skip in an emergency: `git commit -n`.
+#
+# We only run when staged changes touch the Rust crate at src-tauri/.
+# Matching CI: the check runs from src-tauri/ and uses the same flag.
+
+set -euo pipefail
+
+# `git diff --cached --name-only` lists staged paths relative to the
+# repo root. If none of them are under src-tauri/ there's nothing for
+# rustfmt to verify, so we exit fast.
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if ! git diff --cached --name-only --diff-filter=ACMR \
+        | grep -q '^src-tauri/.*\.rs$'; then
+    exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not on PATH; skipping rustfmt check" >&2
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --check (src-tauri)"
+if ! ( cd src-tauri && cargo fmt --check ); then
+    cat >&2 <<'EOF'
+
+pre-commit: rustfmt would change one or more files.
+
+Run `cd src-tauri && cargo fmt` to apply the fixes, then re-stage
+and commit. To bypass this hook in an emergency, use `git commit -n`.
+EOF
+    exit 1
+fi

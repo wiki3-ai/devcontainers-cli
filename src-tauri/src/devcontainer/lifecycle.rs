@@ -1874,7 +1874,10 @@ mod tests {
         let dir = tempdir();
         let cfg = dir.join("devcontainer.json");
         let df = dir.join("Dockerfile");
-        std::fs::File::create(&cfg).unwrap().write_all(b"{}").unwrap();
+        std::fs::File::create(&cfg)
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
         std::fs::File::create(&df)
             .unwrap()
             .write_all(b"FROM alpine:3.19\n")
