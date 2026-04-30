@@ -99,6 +99,13 @@ pub struct ParsedDevContainer {
     /// passed to `docker run` exactly as written.
     #[serde(default)]
     pub run_args: Vec<String>,
+    /// Ports to forward from the container to the host. The
+    /// devcontainer spec allows entries to be either bare integers
+    /// (`8000`) or strings (`"8000"`, `"host:8000"`); the
+    /// [`config`](crate::devcontainer::config) parser normalises both
+    /// forms into u16 container ports.
+    ///
+    /// [`config`]: super::config
     #[serde(default)]
     pub forward_ports: Vec<u16>,
     #[serde(default)]
@@ -107,6 +114,12 @@ pub struct ParsedDevContainer {
     pub container_env: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub remote_env: std::collections::HashMap<String, Option<String>>,
+    /// Tool-specific configuration (e.g. `customizations.vscode`,
+    /// `customizations.wiki3`). Carried through verbatim so embedding
+    /// apps can read their own keys without a second pass over the
+    /// raw file.
+    #[serde(default)]
+    pub customizations: Option<serde_json::Value>,
     #[serde(default)]
     pub on_create_command: Option<LifecycleCommand>,
     #[serde(default)]
