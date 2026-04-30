@@ -71,41 +71,31 @@ isn't up, a `container system start` invocation whose log lines (
 piped into the dashboard log pane. The result is cached in an
 `AtomicBool` on the runtime so subsequent calls are free.
 
-The same step also makes a one-time best-effort attempt to register
-`host.docker.internal` as a localhost-redirect DNS domain. Apple's
-`container` runtime has no built-in equivalent of Docker Desktop's
-`host.docker.internal`; the documented mechanism is `sudo container
-system dns create <domain> --localhost <ipv4-addr>`, which writes a
-scoped resolver under `/etc/resolver/<domain>` and reloads
-`mDNSResponder` plus a packet-filter rule that forwards `<ipv4-addr>`
-back to `127.0.0.1` on the host. The backend:
+The same step previously also installed a system-wide
+`host.docker.internal` DNS shim via `container system dns create`,
+but we removed that: registering the domain rewrites Apple's PF
+anchors and breaks `--publish` port forwarding on macOS 15. Instead,
+host-loopback URLs are rewritten to a literal IP at the boundaries
+where containers consume them:
 
-1. runs `container system dns ls` (no privilege required) and skips
-   out if `host.docker.internal` is already there;
-2. otherwise shells out via `osascript -e 'do shell script "<container>
-   system dns create host.docker.internal --localhost 192.168.64.1"
-   with administrator privileges'`, surfacing the standard macOS auth
-   dialog exactly once. The redirect IP is `192.168.64.1`, the Apple
-   Containers default bridge gateway: traffic to the gateway already
-   reaches host services, so this works without depending on Apple's
-   PF redirect rule (which is absent when the optional
-   `container-network` plugin isn't installed).
+- **Build args** ([`merge_proxy_build_args`](../src-tauri/crates/devcontainer-core/src/devcontainer/lifecycle.rs)
+  in core, plus the wiki3-app mirror) replace any loopback host
+  (`localhost`, `127.0.0.1`, `::1`) inside the standard proxy env
+  vars (`HTTP_PROXY`, `HTTPS_PROXY`, etc.) with `192.168.64.1` —
+  Apple Containers' default bridge gateway. The build sandbox does
+  not consult the host resolver, so a literal IP is the only
+  reliable option.
+- **Container env vars** can use the same address at runtime; from
+  inside a container `192.168.64.1` reaches services bound on the
+  host's bridge interface (or `0.0.0.0`).
 
-   **Note on build sandboxes.** `container build`'s sandbox does not
-   consult the host resolver, so `host.docker.internal` won't resolve
-   from inside RUN steps. For build-time URLs (e.g. `HTTPS_PROXY`)
-   the lifecycle's [`merge_proxy_build_args`](../src-tauri/crates/devcontainer-core/src/devcontainer/lifecycle.rs)
-   rewrites loopback host literals (`localhost`, `127.0.0.1`, `::1`)
-   directly to the same `192.168.64.1` literal so build-time proxy
-   access works without DNS.
-
-The registration persists across host reboots until the user runs
-`sudo container system dns delete host.docker.internal`. If the user
-cancels the prompt or the command fails for any other reason the
-backend logs a warning and continues — every other lifecycle op is
-unaffected, only resolution of `host.docker.internal` from inside
-containers will not work. An `AtomicBool` on the runtime guarantees
-the prompt is shown at most once per process.
+If you need `host.docker.internal` *inside* a container you can still
+register it manually with `sudo container system dns create
+host.docker.internal --localhost 192.168.64.1`, but be aware that on
+macOS 15 this currently disables host→container port forwarding
+until you run `sudo container system dns delete host.docker.internal`
+and restart the container daemon. We do not register it
+automatically.
 
 `LifecycleOrchestrator::resolve_image` decides per-workspace what to do:
 
@@ -204,7 +194,7 @@ same events.
 | `mounts`                           | Forwarded to `container run --mount`.                                 |
 | `containerEnv`, `remoteEnv`        | Forwarded as `--env KEY=VALUE`.                                       |
 | `runArgs`                          | Appended verbatim to `container run`.                                 |
-| `forwardPorts`                     | Tracked, surfaced in the UI; no automatic publish yet.                |
+| `forwardPorts`                     | Translated to `--publish <port>:<port>/tcp` on `container run`.       |
 | `onCreateCommand`, `updateContentCommand`, `postCreateCommand` | **Create-time** hooks. Run once per container instance, in this order, immediately after the first successful create+start. We stamp `/var/devcontainer/postcreate_done` inside the container after they succeed; on subsequent starts (stop+start, or adoption-by-name on app boot) we probe that sentinel and skip these hooks if it exists. |
 | `postStartCommand`, `postAttachCommand` | **Start-time** hooks. Run on every successful start, including after a plain `Start` of an already-created container. (`postAttachCommand` currently runs alongside `postStartCommand` until a real attach surface lands.) |
 | `initializeCommand`                | Host-side hook. Not implemented in the MVP; deferred behind the Phase 2 permission model. |

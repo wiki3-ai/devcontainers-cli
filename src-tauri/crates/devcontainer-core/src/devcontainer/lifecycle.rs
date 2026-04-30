@@ -889,16 +889,22 @@ impl LifecycleOrchestrator {
             ("postAttachCommand", parsed.post_attach_command.as_ref()),
         ] {
             if let Some(cmd) = hook {
-                run_hook(
+                // postStart / postAttach commonly run long-lived
+                // entrypoints (e.g. `jupyter lab`) that never exit.
+                // Awaiting them here would hold the per-workspace
+                // lock indefinitely and silently block every
+                // subsequent Stop / Restart / Rebuild / Remove. Spawn
+                // them detached: the user sees a system-stream log
+                // line, and the orchestrator returns control.
+                spawn_detached_hook(
                     sink,
-                    runtime.as_ref(),
+                    runtime.clone(),
                     workspace_id,
                     &container_id,
                     &spec,
                     label,
                     cmd,
-                )
-                .await?;
+                );
             }
         }
 
@@ -1280,6 +1286,86 @@ async fn run_hook(
         });
     }
     Ok(())
+}
+
+/// Spawn a lifecycle hook detached on the tokio runtime so the
+/// orchestrator can return control even when the hook never exits
+/// (e.g. `postStartCommand: "jupyter lab"`). Output and the eventual
+/// exit code are reported via `tracing` only — we don't have a
+/// 'static [`EventSink`] handle here. The user sees a single
+/// system-stream "started <hook> in background" line through the
+/// caller's sink before this returns.
+fn spawn_detached_hook(
+    sink: &dyn EventSink,
+    runtime: Arc<dyn ContainerRuntime>,
+    workspace_id: &str,
+    container_id: &str,
+    spec: &crate::container::ContainerSpec,
+    label: &'static str,
+    cmd: &LifecycleCommand,
+) {
+    let argv = cmd.to_argv();
+    if argv.is_empty() {
+        return;
+    }
+    sink.log(
+        workspace_id,
+        LogStreamKind::System,
+        &format!(
+            "running {label} in background: {}  (orchestrator does not await long-lived hooks)",
+            argv.join(" ")
+        ),
+    );
+    let workspace_id = workspace_id.to_string();
+    let container_id = container_id.to_string();
+    let opts = ExecOptions {
+        command: argv,
+        workdir: spec.workdir.clone(),
+        env: spec.env.clone(),
+        user: spec.user.clone(),
+        tty: false,
+    };
+    tokio::spawn(async move {
+        info!(
+            workspace = %workspace_id,
+            container = %container_id,
+            hook = label,
+            "running detached lifecycle hook"
+        );
+        match runtime.exec(&container_id, &opts).await {
+            Ok(result) => {
+                if result.exit_code != 0 {
+                    let stderr_text = String::from_utf8_lossy(&result.stderr);
+                    let mut tail = stderr_text.trim().to_string();
+                    if tail.len() > 1024 {
+                        let start = tail.len() - 1024;
+                        tail = format!("…{}", &tail[start..]);
+                    }
+                    warn!(
+                        workspace = %workspace_id,
+                        hook = label,
+                        exit_code = result.exit_code,
+                        stderr = %tail,
+                        "detached lifecycle hook exited non-zero"
+                    );
+                } else {
+                    info!(
+                        workspace = %workspace_id,
+                        hook = label,
+                        "detached lifecycle hook exited cleanly"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    workspace = %workspace_id,
+                    hook = label,
+                    error = %err,
+                    "detached lifecycle hook failed to launch"
+                );
+            }
+        }
+    });
 }
 
 /// `devcontainer.json` lifecycle hook identifier. Re-exported from the
