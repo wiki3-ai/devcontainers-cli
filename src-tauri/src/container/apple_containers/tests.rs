@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::cli::{
-    build_args_with_dns, create_args, exec_args, image_ref_to_string, logs_args, parse_inspect,
-    parse_list, pull_args, remove_args,
+    build_args_with_dns, create_args, exec_args, image_label_from_inspect, image_list_contains,
+    image_ref_to_string, logs_args, parse_inspect, parse_list, pull_args, remove_args,
+    system_status_is_running,
 };
 use crate::container::traits::{
     BuildSpec, ContainerSpec, ContainerState, ExecOptions, ImageRef, LogOptions, MountKind,
@@ -74,6 +75,7 @@ fn create_args_sorts_env_and_appends_image_last() {
         user: Some("vscode".into()),
         privileged: false,
         run_args: vec![],
+        labels: HashMap::new(),
     };
     let args = create_args(&spec);
 
@@ -118,6 +120,7 @@ fn create_args_marks_readonly_bind() {
         user: None,
         privileged: true,
         run_args: vec![],
+        labels: HashMap::new(),
     };
     let args = create_args(&spec);
     let mount = args.iter().position(|a| a == "--mount").unwrap();
@@ -141,6 +144,7 @@ fn create_args_inserts_run_args_before_image() {
         user: None,
         privileged: false,
         run_args: vec!["--cpus=4".into(), "--memory=8g".into()],
+        labels: HashMap::new(),
     };
     let args = create_args(&spec);
     let img_idx = args.iter().position(|a| a == "ubuntu:24.04").unwrap();
@@ -163,6 +167,7 @@ fn build_args_appends_dns_before_context() {
         dockerfile: PathBuf::from("/ctx/Dockerfile"),
         build_args: HashMap::new(),
         target: None,
+        labels: HashMap::new(),
     };
     let dns = vec!["192.168.1.1".to_string(), "1.1.1.1".to_string()];
     let a = build_args_with_dns(&spec, &dns);
@@ -182,6 +187,7 @@ fn build_args_with_no_dns_omits_flag() {
         dockerfile: PathBuf::from("/ctx/Dockerfile"),
         build_args: HashMap::new(),
         target: None,
+        labels: HashMap::new(),
     };
     let a = build_args_with_dns(&spec, &[]);
     assert!(!a.iter().any(|x| x == "--dns"));
@@ -323,4 +329,100 @@ fn parse_inspect_no_mounts_yields_empty_vec() {
     let s = r#"{"id":"x","status":"running"}"#;
     let st = parse_inspect(s, "x").unwrap();
     assert!(st.host_mounts.is_empty());
+}
+
+#[test]
+fn system_status_running_recognised() {
+    let stdout = "FIELD              VALUE\nstatus             running\nappRoot            /tmp\n";
+    assert!(system_status_is_running(stdout));
+}
+
+#[test]
+fn system_status_stopped_recognised() {
+    let stdout = "FIELD              VALUE\nstatus             stopped\n";
+    assert!(!system_status_is_running(stdout));
+}
+
+#[test]
+fn system_status_empty_treated_as_not_running() {
+    assert!(!system_status_is_running(""));
+    assert!(!system_status_is_running("garbage output\n"));
+}
+
+#[test]
+fn image_list_contains_matches_reference() {
+    let stdout = r#"[
+        {"reference":"alpine:3.19"},
+        {"reference":"devcontainer-foo:latest"}
+    ]"#;
+    assert!(image_list_contains(stdout, "devcontainer-foo:latest"));
+    assert!(!image_list_contains(stdout, "devcontainer-bar:latest"));
+    assert!(!image_list_contains("", "devcontainer-foo:latest"));
+    assert!(!image_list_contains("not json", "devcontainer-foo:latest"));
+}
+
+#[test]
+fn image_label_from_inspect_reads_nested_labels() {
+    let stdout = r#"[{
+        "variants":[
+            {"platform":{"os":"linux","architecture":"arm64"},
+             "config":{"config":{"Labels":{
+                "org.devcontainers.config_hash":"abc123",
+                "maintainer":"jim"
+             }}}}
+        ]
+    }]"#;
+    assert_eq!(
+        image_label_from_inspect(stdout, "org.devcontainers.config_hash"),
+        Some("abc123".to_string())
+    );
+    assert_eq!(image_label_from_inspect(stdout, "missing"), None);
+    assert_eq!(image_label_from_inspect("", "k"), None);
+}
+
+#[test]
+fn build_args_emits_sorted_labels() {
+    let mut labels = HashMap::new();
+    labels.insert("zeta".into(), "Z".into());
+    labels.insert("alpha".into(), "A".into());
+    let spec = BuildSpec {
+        tag: ubuntu(),
+        context_dir: PathBuf::from("/ctx"),
+        dockerfile: PathBuf::from("/ctx/Dockerfile"),
+        build_args: HashMap::new(),
+        target: None,
+        labels,
+    };
+    let a = build_args_with_dns(&spec, &[]);
+    let alpha = a.iter().position(|x| x == "alpha=A").unwrap();
+    let zeta = a.iter().position(|x| x == "zeta=Z").unwrap();
+    assert!(alpha < zeta, "labels must be sorted: {a:?}");
+    // Each label is preceded by `--label`.
+    assert_eq!(a[alpha - 1], "--label");
+    assert_eq!(a[zeta - 1], "--label");
+}
+
+#[test]
+fn create_args_emits_label_flag_before_run_args() {
+    let mut labels = HashMap::new();
+    labels.insert("org.devcontainers.config_hash".into(), "deadbeef".into());
+    let spec = ContainerSpec {
+        name: "lbl".into(),
+        image: ubuntu(),
+        command: None,
+        workdir: None,
+        env: HashMap::new(),
+        mounts: vec![],
+        ports: vec![],
+        user: None,
+        privileged: false,
+        run_args: vec!["--cpus=2".into()],
+        labels,
+    };
+    let args = create_args(&spec);
+    let label_flag = args.iter().position(|a| a == "--label").unwrap();
+    let label_val = label_flag + 1;
+    let runarg = args.iter().position(|a| a == "--cpus=2").unwrap();
+    assert_eq!(args[label_val], "org.devcontainers.config_hash=deadbeef");
+    assert!(label_val < runarg, "labels precede run_args: {args:?}");
 }

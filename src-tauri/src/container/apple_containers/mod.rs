@@ -12,6 +12,7 @@
 
 use std::ffi::OsStr;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -34,9 +35,23 @@ pub use cli::ContainerCli;
 /// Apple Containers backend. The binary name (`container` by default) is
 /// configurable via [`AppleContainersRuntime::with_binary`] so the live
 /// integration tests can point at a fake on `$PATH`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AppleContainersRuntime {
     cli: ContainerCli,
+    /// Set once `ensure_system_running` confirms the daemon is up. Skips
+    /// the `container system status` round-trip on subsequent calls in
+    /// the same process. We never reset this — if the daemon dies mid-
+    /// session the next CLI call surfaces the failure on its own.
+    system_ready: AtomicBool,
+}
+
+impl Clone for AppleContainersRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            cli: self.cli.clone(),
+            system_ready: AtomicBool::new(self.system_ready.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Default for AppleContainersRuntime {
@@ -49,12 +64,14 @@ impl AppleContainersRuntime {
     pub fn new() -> Self {
         Self {
             cli: ContainerCli::default(),
+            system_ready: AtomicBool::new(false),
         }
     }
 
     pub fn with_binary(binary: impl Into<String>) -> Self {
         Self {
             cli: ContainerCli::new(binary),
+            system_ready: AtomicBool::new(false),
         }
     }
 }
@@ -96,6 +113,75 @@ impl ContainerRuntime for AppleContainersRuntime {
         let args = cli::pull_args(image);
         run_capturing(&self.cli, args.iter().map(String::as_str)).await?;
         Ok(())
+    }
+
+    async fn ensure_system_running(
+        &self,
+        log_sink: Option<mpsc::Sender<LogChunk>>,
+    ) -> Result<(), ContainerRuntimeError> {
+        if self.system_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // `container system status` is the cheapest probe: it prints a
+        // table whose first data row is `status running` (or `stopped`).
+        // Failure to parse is treated as "not running" so we attempt a
+        // start; that is harmless when the daemon really is up because
+        // `container system start` is idempotent and exits 0.
+        let status_text = match run_capturing(&self.cli, ["system", "status"]).await {
+            Ok((stdout, _)) => stdout,
+            Err(_) => String::new(),
+        };
+        if cli::system_status_is_running(&status_text) {
+            self.system_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        if let Some(sink) = &log_sink {
+            let _ = sink
+                .send(LogChunk {
+                    stream: LogStreamKind::System,
+                    line: "container system not running; starting…".into(),
+                })
+                .await;
+        }
+        info!(binary = self.cli.binary(), "starting container system");
+        run_capturing(&self.cli, ["system", "start"]).await?;
+        if let Some(sink) = &log_sink {
+            let _ = sink
+                .send(LogChunk {
+                    stream: LogStreamKind::System,
+                    line: "container system started".into(),
+                })
+                .await;
+        }
+        self.system_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn image_exists(&self, image: &ImageRef) -> Result<bool, ContainerRuntimeError> {
+        let (stdout, _) =
+            match run_capturing(&self.cli, ["image", "list", "--format", "json"]).await {
+                Ok(p) => p,
+                Err(e) => return Err(e),
+            };
+        let needle = cli::image_ref_to_string(image);
+        Ok(cli::image_list_contains(&stdout, &needle))
+    }
+
+    async fn image_label(
+        &self,
+        image: &ImageRef,
+        key: &str,
+    ) -> Result<Option<String>, ContainerRuntimeError> {
+        let needle = cli::image_ref_to_string(image);
+        let (stdout, _) =
+            match run_capturing(&self.cli, ["image", "inspect", &needle]).await {
+                Ok(p) => p,
+                // Apple returns a non-zero exit when the image is absent;
+                // surface that as `Ok(None)` rather than a hard error so
+                // callers can treat "absent" and "label missing" the same.
+                Err(_) => return Ok(None),
+            };
+        Ok(cli::image_label_from_inspect(&stdout, key))
     }
 
     /// Build an image via `container build`. Streams stdout/stderr lines
@@ -443,6 +529,11 @@ pub(crate) struct InspectConfiguration {
     /// `source` (host-side path) for repo linkage; the rest is ignored.
     #[serde(default)]
     pub mounts: Vec<InspectMount>,
+    /// Per-container labels stamped at create time. Key/value strings.
+    /// The orchestrator reads `org.devcontainers.config_hash` from here
+    /// to detect drift without app-side state.
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,9 +566,9 @@ impl InspectShape {
             Some(ref s) if s == "created" => ContainerState::Created,
             _ => ContainerState::Unknown,
         };
-        let (cfg_id, cfg_image, cfg_mounts) = match self.configuration {
-            Some(c) => (c.id, c.image, c.mounts),
-            None => (None, None, Vec::new()),
+        let (cfg_id, cfg_image, cfg_mounts, cfg_labels) = match self.configuration {
+            Some(c) => (c.id, c.image, c.mounts, c.labels),
+            None => (None, None, Vec::new(), std::collections::HashMap::new()),
         };
         let container_id = cfg_id.or(self.id).or(self.name).unwrap_or_default();
         let image_ref = cfg_image
@@ -492,6 +583,7 @@ impl InspectShape {
             state,
             image_ref,
             host_mounts,
+            labels: cfg_labels,
         }
     }
 }

@@ -94,6 +94,12 @@ pub(crate) fn build_args_with_dns(spec: &BuildSpec, dns: &[String]) -> Vec<Strin
         a.push("--target".to_string());
         a.push(target.clone());
     }
+    let mut labels: Vec<(&String, &String)> = spec.labels.iter().collect();
+    labels.sort_by(|x, y| x.0.cmp(y.0));
+    for (k, v) in labels {
+        a.push("--label".to_string());
+        a.push(format!("{k}={v}"));
+    }
     // Prepend the host's resolvers as `--dns` flags so the build VM
     // does not start with an empty resolver list. Apple's buildkit
     // sandbox otherwise inherits no DNS, which surfaces as the
@@ -202,6 +208,13 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<String> {
     }
     if spec.privileged {
         a.push("--privileged".to_string());
+    }
+
+    let mut labels: Vec<(&String, &String)> = spec.labels.iter().collect();
+    labels.sort_by(|x, y| x.0.cmp(y.0));
+    for (k, v) in labels {
+        a.push("--label".to_string());
+        a.push(format!("{k}={v}"));
     }
 
     // Verbatim devcontainer.json `runArgs`. Inserted immediately
@@ -342,4 +355,70 @@ pub(crate) fn parse_list(stdout: &str) -> Result<Vec<ContainerStatus>, Container
         ContainerRuntimeError::Backend(format!("could not parse `container list`: {e}"))
     })?;
     Ok(arr.into_iter().map(InspectShape::into_status).collect())
+}
+
+/// Parse the textual output of `container system status` and decide
+/// whether the daemon is up. The CLI prints a key/value table whose
+/// first data row is `status running` or `status stopped`. Any
+/// unrecognised output is treated as "not running" so the caller will
+/// attempt a start (which is idempotent).
+pub(crate) fn system_status_is_running(stdout: &str) -> bool {
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("status") {
+            let value = rest.trim();
+            if value.eq_ignore_ascii_case("running") {
+                return true;
+            }
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether `container image list --format json` contains an entry whose
+/// `reference` matches `needle` (a fully-formed image reference such as
+/// `devcontainer-foo:latest`). Robust against missing fields and
+/// non-JSON output (returns false).
+pub(crate) fn image_list_contains(stdout: &str, needle: &str) -> bool {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) else {
+        return false;
+    };
+    arr.iter().any(|v| {
+        v.get("reference")
+            .and_then(|r| r.as_str())
+            .map(|s| s == needle)
+            .unwrap_or(false)
+    })
+}
+
+/// Read a config-time label from `container image inspect <ref>` output.
+/// Apple's CLI returns an array of image entries, each with one or more
+/// `variants[].config.config.Labels` maps. We scan all variants so a
+/// platform-specific build is found regardless of host architecture.
+pub(crate) fn image_label_from_inspect(stdout: &str, key: &str) -> Option<String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let arr: Vec<serde_json::Value> = serde_json::from_str(trimmed).ok()?;
+    for entry in arr {
+        let variants = entry.get("variants")?.as_array()?.clone();
+        for v in variants {
+            let labels = v
+                .get("config")
+                .and_then(|c| c.get("config"))
+                .and_then(|c| c.get("Labels"));
+            if let Some(map) = labels.and_then(|l| l.as_object()) {
+                if let Some(val) = map.get(key).and_then(|s| s.as_str()) {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
 }

@@ -59,6 +59,10 @@ pub async fn list_containers(
     registry: State<'_, RuntimeRegistry>,
 ) -> Result<Vec<ContainerEntry>, String> {
     let runtime = registry.selected();
+    runtime
+        .ensure_system_running(None)
+        .await
+        .map_err(|e| e.to_string())?;
     let statuses = runtime.list().await.map_err(|e| e.to_string())?;
     Ok(statuses
         .into_iter()
@@ -88,6 +92,10 @@ pub async fn container_start_by_id(
 ) -> Result<(), String> {
     let runtime = registry.selected();
     runtime
+        .ensure_system_running(None)
+        .await
+        .map_err(|e| e.to_string())?;
+    runtime
         .start(&container_id)
         .await
         .map_err(|e| e.to_string())
@@ -99,6 +107,10 @@ pub async fn container_stop_by_id(
     container_id: String,
 ) -> Result<(), String> {
     let runtime = registry.selected();
+    runtime
+        .ensure_system_running(None)
+        .await
+        .map_err(|e| e.to_string())?;
     runtime.stop(&container_id).await.map_err(|e| e.to_string())
 }
 
@@ -109,6 +121,10 @@ pub async fn container_remove_by_id(
     force: bool,
 ) -> Result<(), String> {
     let runtime = registry.selected();
+    runtime
+        .ensure_system_running(None)
+        .await
+        .map_err(|e| e.to_string())?;
     runtime
         .remove(&container_id, force)
         .await

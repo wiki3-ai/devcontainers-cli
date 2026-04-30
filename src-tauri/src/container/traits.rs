@@ -87,6 +87,11 @@ pub struct ContainerSpec {
     /// flags it does not understand.
     #[serde(default)]
     pub run_args: Vec<String>,
+    /// Labels stamped onto the container at create time. The orchestrator
+    /// uses these to remember the config-hash and other facts that need
+    /// to survive an app restart without local state.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 /// Runtime-agnostic input for [`ContainerRuntime::build`]. The
@@ -104,6 +109,11 @@ pub struct BuildSpec {
     pub build_args: HashMap<String, String>,
     /// Multi-stage build target.
     pub target: Option<String>,
+    /// `--label` key/value pairs stamped onto the resulting image.
+    /// Used by the orchestrator to record the config-hash so a future
+    /// `up` can decide whether the cached image is still current.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +127,13 @@ pub struct ContainerStatus {
     /// convention.
     #[serde(default)]
     pub host_mounts: Vec<String>,
+    /// Labels reported by the runtime for this container. The
+    /// orchestrator looks up `org.devcontainers.config_hash` and
+    /// related keys here to detect drift without storing app-side
+    /// state. Empty when the runtime does not expose labels (e.g.,
+    /// older Apple `container` builds).
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +206,40 @@ pub trait ContainerRuntime: Send + Sync {
     /// must not panic on missing tools — they should return `Ok(false)` and
     /// optionally a `reason`.
     async fn probe(&self) -> Result<RuntimeAvailability, ContainerRuntimeError>;
+
+    /// Ensure any out-of-process daemon/services this backend depends on
+    /// are running, starting them if necessary. Idempotent. The default
+    /// is a no-op for backends that have no separate service component.
+    /// Optional `log_sink` receives system-stream messages so callers
+    /// can surface "starting container system…" in the UI.
+    async fn ensure_system_running(
+        &self,
+        log_sink: Option<mpsc::Sender<LogChunk>>,
+    ) -> Result<(), ContainerRuntimeError> {
+        let _ = log_sink;
+        Ok(())
+    }
+
+    /// Whether an image with this reference is already present locally.
+    /// Backends that cannot answer cheaply may always return `false`,
+    /// which makes callers fall through to a real `pull`/`build`.
+    async fn image_exists(&self, image: &ImageRef) -> Result<bool, ContainerRuntimeError> {
+        let _ = image;
+        Ok(false)
+    }
+
+    /// Read the value of an OCI image config label. Returns `Ok(None)`
+    /// when the image is missing or the label is not set. Used by the
+    /// orchestrator to decide whether a cached image still matches the
+    /// current devcontainer.json + Dockerfile fingerprint.
+    async fn image_label(
+        &self,
+        image: &ImageRef,
+        key: &str,
+    ) -> Result<Option<String>, ContainerRuntimeError> {
+        let _ = (image, key);
+        Ok(None)
+    }
 
     async fn pull(&self, image: &ImageRef) -> Result<(), ContainerRuntimeError>;
     /// Build an image from a Dockerfile. Backends that do not support

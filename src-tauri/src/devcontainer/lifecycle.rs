@@ -38,6 +38,12 @@ use crate::devcontainer::translate::{
     parse_image_ref, to_container_spec, DevContainerBuild, LifecycleCommand, ParsedDevContainer,
 };
 
+/// Label key under which the orchestrator stamps the configuration
+/// fingerprint on every built image and created container. Reading it
+/// back during `up` lets us tell the user the cached artifact is stale
+/// without keeping any in-memory state.
+pub const LABEL_CONFIG_HASH: &str = "org.devcontainers.config_hash";
+
 /// Reject only what we genuinely cannot run yet. Today that's compose;
 /// `image` and `build` (Dockerfile) are both supported.
 fn validate_supported(parsed: &ParsedDevContainer) -> Result<(), LifecycleError> {
@@ -81,6 +87,40 @@ fn sanitize_image_tag(input: &str) -> String {
         out.truncate(128);
     }
     out
+}
+
+/// Compute a fingerprint of the inputs that should force a rebuild when
+/// they change: the bytes of `devcontainer.json` plus, if the config
+/// uses a `build:` stanza, the bytes of the resolved Dockerfile. The
+/// hash deliberately ignores files merely referenced by `COPY` in the
+/// Dockerfile — BuildKit's own layer cache handles those, and the
+/// "Rebuild" button is the escape hatch when it gets it wrong.
+///
+/// Returns `None` when neither input can be read; callers treat that
+/// as "no fingerprint available" and skip both the stamp and the
+/// drift check rather than stamp something meaningless.
+fn compute_config_hash(parsed: &ParsedDevContainer, dockerfile: Option<&Path>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut got_input = false;
+    if let Some(cfg) = parsed.config_file_path.as_ref() {
+        if let Ok(bytes) = std::fs::read(cfg) {
+            hasher.update(b"devcontainer.json:");
+            hasher.update(&bytes);
+            got_input = true;
+        }
+    }
+    if let Some(df) = dockerfile {
+        if let Ok(bytes) = std::fs::read(df) {
+            hasher.update(b"Dockerfile:");
+            hasher.update(&bytes);
+            got_input = true;
+        }
+    }
+    if !got_input {
+        return None;
+    }
+    Some(hex::encode(hasher.finalize()))
 }
 
 #[derive(Debug, Error)]
@@ -348,9 +388,45 @@ impl LifecycleOrchestrator {
         workspace_id: &str,
         host_workspace: &Path,
         parsed: &ParsedDevContainer,
+        config_hash: Option<&str>,
     ) -> Result<ImageRef, LifecycleError> {
         if let Some(build) = parsed.build.as_ref() {
-            let build_spec = self.resolve_build_spec(workspace_id, host_workspace, parsed, build);
+            let mut build_spec =
+                self.resolve_build_spec(workspace_id, host_workspace, parsed, build);
+            if let Some(h) = config_hash {
+                build_spec
+                    .labels
+                    .insert(LABEL_CONFIG_HASH.to_string(), h.to_string());
+            }
+
+            // Check the local image cache: if a previous build already
+            // produced an image with the same config-hash label, we can
+            // skip the build entirely. The user clicks Rebuild to force
+            // a fresh build.
+            if let Some(h) = config_hash {
+                if let Ok(Some(existing)) = runtime
+                    .image_label(&build_spec.tag, LABEL_CONFIG_HASH)
+                    .await
+                {
+                    if existing == h {
+                        sink.log(
+                            workspace_id,
+                            LogStreamKind::System,
+                            &format!(
+                                "image {} already current (config_hash matches); skipping build",
+                                build_spec.tag.repository
+                            ),
+                        );
+                        info!(
+                            workspace = workspace_id,
+                            tag = %build_spec.tag.repository,
+                            "stage=build skipped (cache hit on config_hash)"
+                        );
+                        return Ok(build_spec.tag);
+                    }
+                }
+            }
+
             sink.status(
                 workspace_id,
                 "building",
@@ -399,6 +475,22 @@ impl LifecycleOrchestrator {
                 .as_deref()
                 .expect("validate_supported guarantees image or build");
             let image_ref = parse_image_ref(image_str);
+            // Skip the pull when the image is already present locally;
+            // pulled images don't carry our config_hash label so we
+            // rely on simple presence here. Network-side updates
+            // (registry tag moved) are handled by Rebuild.
+            if matches!(runtime.image_exists(&image_ref).await, Ok(true)) {
+                sink.log(
+                    workspace_id,
+                    LogStreamKind::System,
+                    &format!(
+                        "image {} already present locally; skipping pull",
+                        image_ref.repository
+                    ),
+                );
+                info!(workspace = workspace_id, image = %image_ref.repository, "stage=pull skipped (already local)");
+                return Ok(image_ref);
+            }
             sink.status(
                 workspace_id,
                 "pulling",
@@ -452,6 +544,7 @@ impl LifecycleOrchestrator {
             dockerfile,
             build_args: build.args.clone(),
             target: build.target.clone(),
+            labels: HashMap::new(),
         }
     }
 
@@ -465,6 +558,20 @@ impl LifecycleOrchestrator {
         let parsed = self.parsed(workspace_id)?;
         let runtime = registry.selected();
         validate_supported(&parsed)?;
+        ensure_runtime_ready(sink, runtime.as_ref(), workspace_id).await?;
+
+        // Compute the config-hash up front so we can both gate
+        // unnecessary rebuilds and stamp it on the container we end up
+        // with. Only `build:` configs use the Dockerfile component.
+        let dockerfile_path: Option<std::path::PathBuf> = parsed.build.as_ref().map(|b| {
+            let cfg_dir: std::path::PathBuf = parsed
+                .config_file_path
+                .as_ref()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| host_workspace.join(".devcontainer"));
+            cfg_dir.join(b.dockerfile.as_deref().unwrap_or("Dockerfile"))
+        });
+        let config_hash = compute_config_hash(&parsed, dockerfile_path.as_deref());
 
         // Resolve the image: either pull a pre-built one, or build from a
         // Dockerfile. The result is the ImageRef we hand to `create`.
@@ -475,9 +582,14 @@ impl LifecycleOrchestrator {
                 workspace_id,
                 host_workspace,
                 &parsed,
+                config_hash.as_deref(),
             )
             .await?;
-        let spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
+        let mut spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
+        if let Some(h) = config_hash.as_deref() {
+            spec.labels
+                .insert(LABEL_CONFIG_HASH.to_string(), h.to_string());
+        }
 
         info!(
             workspace = workspace_id,
@@ -622,6 +734,7 @@ impl LifecycleOrchestrator {
             .get(workspace_id)
             .and_then(|s| s.container_id.clone());
         if let Some(cid) = cid {
+            ensure_runtime_ready(sink, runtime.as_ref(), workspace_id).await?;
             info!(workspace = workspace_id, container = %cid, "lifecycle.stop");
             if let Err(err) = stage("stop", runtime.stop(&cid).await) {
                 self.report_failure(sink, workspace_id, "stop", &err);
@@ -672,6 +785,7 @@ impl LifecycleOrchestrator {
                 Some(derive_container_name(workspace_id, host))
             });
         if let Some(cid) = target {
+            ensure_runtime_ready(sink, runtime.as_ref(), workspace_id).await?;
             info!(workspace = workspace_id, container = %cid, "lifecycle.remove");
             match runtime.remove(&cid, true).await {
                 Ok(()) => {}
@@ -807,6 +921,27 @@ fn derive_container_name(workspace_id: &str, host_workspace: &std::path::Path) -
     use crate::devcontainer::translate::{derive_name_from_path, sanitize_entity_name};
     let raw = derive_name_from_path(host_workspace, workspace_id);
     sanitize_entity_name(&raw).unwrap_or_else(|| format!("devcontainer-{workspace_id}"))
+}
+
+/// Make sure the backend's daemon/services are up, surfacing the
+/// optional "starting…" message via the event sink so the dashboard
+/// shows progress on cold starts. Idempotent — Apple's runtime caches
+/// the result and short-circuits subsequent calls.
+async fn ensure_runtime_ready(
+    sink: &dyn EventSink,
+    runtime: &dyn ContainerRuntime,
+    workspace_id: &str,
+) -> Result<(), LifecycleError> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<LogChunk>(8);
+    let pump = async {
+        while let Some(chunk) = rx.recv().await {
+            sink.log(workspace_id, chunk.stream, &chunk.line);
+        }
+    };
+    let work = runtime.ensure_system_running(Some(tx));
+    let (result, ()) = tokio::join!(work, pump);
+    stage("ensure_system_running", result)?;
+    Ok(())
 }
 
 async fn run_hook(
@@ -1118,6 +1253,7 @@ mod tests {
                 state: crate::container::ContainerState::Running,
                 image_ref: None,
                 host_mounts: Vec::new(),
+                labels: HashMap::new(),
             })
         }
         async fn list(&self) -> Result<Vec<ContainerStatus>, ContainerRuntimeError> {
@@ -1424,5 +1560,76 @@ mod tests {
             msg.contains("dockerComposeFile") && msg.contains("one-container-per-repo"),
             "expected compose-rejection error, got: {msg}"
         );
+    }
+
+    // -------- config-hash --------
+
+    #[test]
+    fn compute_config_hash_changes_with_devcontainer_json() {
+        use std::io::Write;
+        let dir = tempdir();
+        let cfg = dir.join("devcontainer.json");
+        std::fs::File::create(&cfg)
+            .unwrap()
+            .write_all(b"{\"image\":\"a\"}")
+            .unwrap();
+        let parsed = ParsedDevContainer {
+            image: Some("a".into()),
+            config_file_path: Some(cfg.clone()),
+            ..Default::default()
+        };
+        let h1 = compute_config_hash(&parsed, None).expect("hash");
+
+        std::fs::File::create(&cfg)
+            .unwrap()
+            .write_all(b"{\"image\":\"b\"}")
+            .unwrap();
+        let h2 = compute_config_hash(&parsed, None).expect("hash");
+        assert_ne!(h1, h2, "edits to devcontainer.json must change the hash");
+    }
+
+    #[test]
+    fn compute_config_hash_changes_with_dockerfile() {
+        use std::io::Write;
+        let dir = tempdir();
+        let cfg = dir.join("devcontainer.json");
+        let df = dir.join("Dockerfile");
+        std::fs::File::create(&cfg).unwrap().write_all(b"{}").unwrap();
+        std::fs::File::create(&df)
+            .unwrap()
+            .write_all(b"FROM alpine:3.19\n")
+            .unwrap();
+        let parsed = ParsedDevContainer {
+            config_file_path: Some(cfg),
+            ..Default::default()
+        };
+        let h1 = compute_config_hash(&parsed, Some(&df)).unwrap();
+        std::fs::File::create(&df)
+            .unwrap()
+            .write_all(b"FROM alpine:3.20\n")
+            .unwrap();
+        let h2 = compute_config_hash(&parsed, Some(&df)).unwrap();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_config_hash_returns_none_when_no_files_readable() {
+        let parsed = ParsedDevContainer::default();
+        assert!(compute_config_hash(&parsed, None).is_none());
+    }
+
+    /// Per-test scratch directory under the OS tempdir. We avoid the
+    /// `tempfile` crate to keep the dev dependencies minimal; cleanup
+    /// is best-effort and irrelevant for these tiny fixtures.
+    fn tempdir() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "devc-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
     }
 }

@@ -192,6 +192,7 @@ pub fn to_container_spec(
         user: parsed.remote_user.clone(),
         privileged: false,
         run_args: parsed.run_args.clone(),
+        labels: std::collections::HashMap::new(),
     }
 }
 
