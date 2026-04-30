@@ -57,8 +57,13 @@ pub async fn submit_parsed_devcontainer(
     workspace_id: String,
     parsed: ParsedDevContainer,
 ) -> Result<(), String> {
-    resolve_workspace(&state, &workspace_id)?;
+    let path = resolve_workspace(&state, &workspace_id)?;
     orchestrator.set_parsed_config(&workspace_id, parsed);
+    // Persist the host-side workspace path on the slot too so Stop /
+    // Rebuild can derive the container name and adopt a still-running
+    // container after an app restart, without waiting for an `up` to
+    // re-record it.
+    orchestrator.record_host_workspace(&workspace_id, &path);
     Ok(())
 }
 

@@ -631,6 +631,26 @@ function updateRepoStatusUi(workspaceId: string): void {
 		sidebarStatus.textContent = formatRepoStatus(workspaceId);
 	}
 	if (state.selected?.kind === 'repo' && state.selected.id === workspaceId) {
+		// Re-render the detail header (and the drift banner that sits
+		// beneath it) so Stop / Restart / Rebuild button enable flags
+		// track the live container state. We can't surgically toggle
+		// disabled flags without mirroring the renderer's state machine,
+		// and the log pane lives further down in the same parent so it
+		// is unaffected. The status-line text is also handled by the
+		// re-render, falling back to a direct edit if for some reason
+		// the header isn't currently mounted.
+		const detail = document.getElementById('detail');
+		const header = detail?.querySelector<HTMLElement>('.detail-header');
+		const ws = state.workspaces.find((w) => w.id === workspaceId);
+		if (detail && header && ws) {
+			const next = renderRepoDetailHeader(ws);
+			header.replaceWith(next);
+			// Reconcile drift banner: remove an existing one, then
+			// re-insert if the live status calls for it.
+			detail.querySelector('.drift-banner')?.remove();
+			const banner = renderDriftBanner(ws);
+			if (banner) next.after(banner);
+		}
 		const line = document.getElementById('status-line');
 		const s = state.statuses[workspaceId];
 		if (line) line.textContent = s ? formatStatusLine(s) : 'no container';
@@ -642,6 +662,15 @@ function updateContainerDetail(): void {
 	const cid = state.selected.id;
 	const c = state.containers.find((x) => x.containerId === cid);
 	if (!c) return;
+	// Re-render the container detail header so Start / Stop button
+	// enable flags track the current container state, then refresh the
+	// status line text. Same rationale as updateRepoStatusUi.
+	const detail = document.getElementById('detail');
+	const header = detail?.querySelector<HTMLElement>('.detail-header');
+	if (detail && header) {
+		const next = renderContainerDetailHeader(c);
+		header.replaceWith(next);
+	}
 	const line = document.getElementById('status-line');
 	if (line) line.textContent = `${c.state}${c.imageRef ? ` — ${c.imageRef}` : ''}`;
 }

@@ -279,6 +279,17 @@ impl LifecycleOrchestrator {
         slot.parsed = Some(parsed);
     }
 
+    /// Record the host-side workspace path for `workspace_id`. Needs
+    /// to land on the slot before the user clicks Stop / Rebuild on a
+    /// freshly-restarted app, so the orchestrator can derive the
+    /// container name and adopt the live container that was created
+    /// in a previous app run.
+    pub fn record_host_workspace(&self, workspace_id: &str, host_workspace: &Path) {
+        let mut map = self.slots.write();
+        let slot = map.entry(workspace_id.to_string()).or_default();
+        slot.host_workspace = Some(host_workspace.to_path_buf());
+    }
+
     /// Read-only snapshot helper used by `container_status` when no
     /// runtime call is needed.
     pub fn snapshot(&self, workspace_id: &str) -> LifecycleStatus {
@@ -329,37 +340,70 @@ impl LifecycleOrchestrator {
         };
 
         let runtime = registry.selected();
+        // Make sure host_workspace is on the slot before we try to
+        // derive a container name from it. This also means subsequent
+        // Stop/Rebuild calls — which read host_workspace off the slot
+        // — work after a plain `container_status` poll, even when the
+        // app was just restarted and `up` hasn't run this session.
+        self.record_host_workspace(workspace_id, host_workspace);
         // Look up the container by recorded id, falling back to the
         // derived name. We don't ensure_system_running here — drift
         // checks happen on a poll and shouldn't surface as an error or
         // boot the daemon as a side-effect; if inspect fails we just
         // leave drift unset.
-        let target = self
+        let recorded = self
             .slots
             .read()
             .get(workspace_id)
-            .and_then(|s| s.container_id.clone())
-            .or_else(|| {
-                let map = self.slots.read();
-                let slot = map.get(workspace_id)?;
-                let host = slot.host_workspace.as_ref()?;
-                Some(derive_container_name(workspace_id, host))
-            });
-        let Some(cid) = target else {
-            return snap;
-        };
-        let live = match runtime.inspect(&cid).await {
+            .and_then(|s| s.container_id.clone());
+        let target = recorded
+            .clone()
+            .unwrap_or_else(|| derive_container_name(workspace_id, host_workspace));
+        let live = match runtime.inspect(&target).await {
             Ok(s) => s,
             Err(_) => return snap,
         };
-        // Surface the live container id on the snapshot if we hadn't
-        // recorded it yet (e.g., adopted-by-name path after restart).
-        if snap.container_id.is_none() && !live.container_id.is_empty() {
-            snap.container_id = Some(live.container_id.clone());
+        // Adopt: persist the live id so subsequent Stop / Rebuild
+        // calls don't have to re-derive it. Also surface it on the
+        // returned snapshot.
+        let live_id = if live.container_id.is_empty() {
+            target.clone()
+        } else {
+            live.container_id.clone()
+        };
+        if recorded.as_deref() != Some(live_id.as_str()) {
+            let mut map = self.slots.write();
+            let slot = map.entry(workspace_id.to_string()).or_default();
+            slot.container_id = Some(live_id.clone());
+            if slot.last_image_ref.is_none() {
+                slot.last_image_ref = live.image_ref.clone();
+            }
+            if slot.last_state.is_none() {
+                slot.last_state = Some(match live.state {
+                    crate::container::ContainerState::Running => "running",
+                    crate::container::ContainerState::Stopped => "stopped",
+                    crate::container::ContainerState::Created => "created",
+                    crate::container::ContainerState::Exited => "exited",
+                    crate::container::ContainerState::Unknown => "unknown",
+                });
+            }
+        }
+        if snap.container_id.is_none() {
+            snap.container_id = Some(live_id);
         }
         if snap.image_ref.is_none() {
             snap.image_ref = live.image_ref.clone();
         }
+        // Reflect the live runtime state on the snapshot too — without
+        // this the dashboard keeps reporting "absent" for a container
+        // that the user can clearly see is running in `container ls`.
+        snap.state = match live.state {
+            crate::container::ContainerState::Running => "running",
+            crate::container::ContainerState::Stopped => "stopped",
+            crate::container::ContainerState::Created => "created",
+            crate::container::ContainerState::Exited => "exited",
+            crate::container::ContainerState::Unknown => "unknown",
+        };
         let stamped = live.labels.get(LABEL_CONFIG_HASH).cloned();
         let dockerfile_path: Option<std::path::PathBuf> = parsed.build.as_ref().map(|b| {
             let cfg_dir: std::path::PathBuf = parsed
@@ -869,17 +913,51 @@ impl LifecycleOrchestrator {
         let _guard = lock.lock().await;
 
         let runtime = registry.selected();
+        // Prefer the recorded id, but fall back to the derived
+        // container name when the slot is empty (typical after an app
+        // restart: the user's container is still running but we
+        // haven't done an `up` this session). Without this fallback
+        // the Stop button is a silent no-op.
         let cid = self
             .slots
             .read()
             .get(workspace_id)
-            .and_then(|s| s.container_id.clone());
+            .and_then(|s| s.container_id.clone())
+            .or_else(|| {
+                let map = self.slots.read();
+                let slot = map.get(workspace_id)?;
+                let host = slot.host_workspace.as_ref()?;
+                Some(derive_container_name(workspace_id, host))
+            });
         if let Some(cid) = cid {
             ensure_runtime_ready(sink, runtime.as_ref(), workspace_id).await?;
             info!(workspace = workspace_id, container = %cid, "lifecycle.stop");
-            if let Err(err) = stage("stop", runtime.stop(&cid).await) {
-                self.report_failure(sink, workspace_id, "stop", &err);
-                return Err(err);
+            match runtime.stop(&cid).await {
+                Ok(()) => {}
+                // Treat "not found" as success — the container we were
+                // about to stop doesn't exist; the desired end state
+                // (not running) is already true. This shows up after
+                // someone runs `container delete` outside the app.
+                Err(ContainerRuntimeError::Backend(msg)) if is_not_found(&msg) => {
+                    info!(
+                        workspace = workspace_id,
+                        container = %cid,
+                        "stop: container not found; treating as success"
+                    );
+                    sink.log(
+                        workspace_id,
+                        LogStreamKind::System,
+                        &format!("container `{cid}` not found (already gone)"),
+                    );
+                    self.record_state(workspace_id, "absent", None, None);
+                    sink.status(workspace_id, "absent", None, None, None);
+                    return Ok(self.snapshot(workspace_id));
+                }
+                Err(err) => {
+                    let lerr = stage::<()>("stop", Err(err)).unwrap_err();
+                    self.report_failure(sink, workspace_id, "stop", &lerr);
+                    return Err(lerr);
+                }
             }
             self.record_state(workspace_id, "stopped", Some(&cid), None);
             sink.status(workspace_id, "stopped", Some(&cid), None, None);
