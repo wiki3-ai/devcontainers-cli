@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::cli::{
-    build_args_with_dns, create_args, exec_args, image_label_from_inspect, image_list_contains,
+    build_args_with_dns, create_args, dns_list_contains, exec_args, image_label_from_inspect,
+    image_list_contains,
     image_ref_to_string, logs_args, parse_inspect, parse_list, pull_args, remove_args,
     system_status_is_running,
 };
@@ -374,6 +375,20 @@ fn image_list_contains_matches_implicit_docker_io_prefix() {
     assert!(image_list_contains(stdout, "library/alpine:3.19"));
     assert!(image_list_contains(stdout, "docker.io/library/alpine:3.19"));
     assert!(!image_list_contains(stdout, "library/busybox:latest"));
+}
+
+#[test]
+fn dns_list_contains_matches_first_column() {
+    // `container system dns ls` prints a header row plus zero or more
+    // domain rows. Match must be on the first whitespace-separated
+    // token so that a substring of e.g. a description column does not
+    // produce a false positive.
+    let stdout = "DOMAIN\nhost.docker.internal\nfoo.test\n";
+    assert!(dns_list_contains(stdout, "host.docker.internal"));
+    assert!(dns_list_contains(stdout, "HOST.DOCKER.INTERNAL"));
+    assert!(!dns_list_contains(stdout, "docker.internal"));
+    assert!(!dns_list_contains("DOMAIN\n", "host.docker.internal"));
+    assert!(!dns_list_contains("", "host.docker.internal"));
 }
 
 #[test]

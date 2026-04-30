@@ -403,6 +403,20 @@ pub(crate) fn image_list_contains(stdout: &str, needle: &str) -> bool {
     })
 }
 
+/// Whether `container system dns ls` mentions `domain` somewhere in its
+/// output. The CLI emits a small text table whose first column is the
+/// domain name; we don't need to fully parse it because the domain
+/// strings we care about (`host.docker.internal`) are unique enough to
+/// match by substring without false positives.
+pub(crate) fn dns_list_contains(stdout: &str, domain: &str) -> bool {
+    stdout.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .map(|first| first.eq_ignore_ascii_case(domain))
+            .unwrap_or(false)
+    })
+}
+
 /// Read a config-time label from `container image inspect <ref>` output.
 /// Apple's CLI returns an array of image entries, each with one or more
 /// `variants[].config.config.Labels` maps. We scan all variants so a

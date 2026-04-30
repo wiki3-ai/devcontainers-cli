@@ -43,6 +43,11 @@ pub struct AppleContainersRuntime {
     /// the same process. We never reset this — if the daemon dies mid-
     /// session the next CLI call surfaces the failure on its own.
     system_ready: AtomicBool,
+    /// Set once we've decided whether `host.docker.internal` is
+    /// registered as a localhost-redirect DNS domain (or attempted to
+    /// register it). Stays set even on failure so we don't pop the
+    /// `osascript` admin prompt repeatedly in the same process.
+    host_internal_dns_checked: AtomicBool,
 }
 
 impl Clone for AppleContainersRuntime {
@@ -50,6 +55,9 @@ impl Clone for AppleContainersRuntime {
         Self {
             cli: self.cli.clone(),
             system_ready: AtomicBool::new(self.system_ready.load(Ordering::Relaxed)),
+            host_internal_dns_checked: AtomicBool::new(
+                self.host_internal_dns_checked.load(Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -65,6 +73,7 @@ impl AppleContainersRuntime {
         Self {
             cli: ContainerCli::default(),
             system_ready: AtomicBool::new(false),
+            host_internal_dns_checked: AtomicBool::new(false),
         }
     }
 
@@ -72,7 +81,180 @@ impl AppleContainersRuntime {
         Self {
             cli: ContainerCli::new(binary),
             system_ready: AtomicBool::new(false),
+            host_internal_dns_checked: AtomicBool::new(false),
         }
+    }
+
+    /// Ensure that `host.docker.internal` resolves to a fixed IP that
+    /// Apple's `container` runtime redirects back to `127.0.0.1` on the
+    /// host. This mirrors Docker Desktop's well-known hostname so apps
+    /// that already use it work unchanged.
+    ///
+    /// Apple's mechanism is system-wide and requires root: `container
+    /// system dns create <domain> --localhost <ip>` writes a scoped
+    /// resolver under `/etc/resolver/<domain>` and reloads
+    /// mDNSResponder + the packet filter. We surface a single
+    /// `osascript` auth prompt for that step; if anything fails we log
+    /// a warning and proceed — every other CLI op stays functional.
+    ///
+    /// Idempotent and best-effort: the `host_internal_dns_checked`
+    /// flag prevents repeated prompts within a single process.
+    async fn ensure_host_internal_dns(&self, log_sink: Option<&mpsc::Sender<LogChunk>>) {
+        if self
+            .host_internal_dns_checked
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        const DOMAIN: &str = "host.docker.internal";
+        // Documentation-range IP (RFC 5737 TEST-NET-3). Won't collide
+        // with any real network and will never be routable, so when
+        // Apple's packet filter rule isn't in place the failure is
+        // immediate rather than mysteriously timing out.
+        const REDIRECT_IP: &str = "203.0.113.113";
+
+        // Cheap pre-check: `dns ls` does not require sudo. Skip the
+        // prompt entirely if the entry is already there.
+        let already_registered = match run_capturing(&self.cli, ["system", "dns", "ls"]).await {
+            Ok((stdout, _)) => cli::dns_list_contains(&stdout, DOMAIN),
+            Err(_) => false,
+        };
+        if already_registered {
+            debug!(domain = DOMAIN, "host-internal DNS already registered");
+            return;
+        }
+
+        if let Some(sink) = log_sink {
+            let _ = sink
+                .send(LogChunk {
+                    stream: LogStreamKind::System,
+                    line: format!(
+                        "registering `{DOMAIN}` -> {REDIRECT_IP} (one-time admin prompt)"
+                    ),
+                })
+                .await;
+        }
+
+        // Apple's `container system dns create` requires admin privs
+        // because it writes to `/etc/resolver/` and reloads
+        // mDNSResponder. Use macOS's `osascript ... with administrator
+        // privileges` to surface the standard auth dialog. Resolve the
+        // binary to an absolute path first because the GUI auth shell
+        // does not inherit the user's `$PATH`.
+        let binary = self.cli.binary().to_string();
+        let resolved = match resolve_absolute_binary(&binary) {
+            Some(p) => p,
+            None => {
+                let msg = format!(
+                    "could not resolve absolute path for `{binary}`; skipping host.docker.internal registration"
+                );
+                warn!("{msg}");
+                if let Some(sink) = log_sink {
+                    let _ = sink
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line: msg,
+                        })
+                        .await;
+                }
+                return;
+            }
+        };
+
+        // Build the inner shell command. The arguments are fixed and
+        // we constructed them ourselves (no user input) so quoting is
+        // straightforward.
+        let inner =
+            format!("{resolved} system dns create {DOMAIN} --localhost {REDIRECT_IP}");
+        // AppleScript single-quotes the command literal; we just need
+        // to escape any embedded double quotes (there are none in the
+        // current form, but be defensive in case `resolved` contains
+        // something like a Homebrew prefix with spaces — rare but
+        // possible on customised installs).
+        let inner_escaped = inner.replace('\\', "\\\\").replace('"', "\\\"");
+        let osa = format!(
+            "do shell script \"{inner_escaped}\" with administrator privileges"
+        );
+
+        let result = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&osa)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        match result {
+            Ok(out) if out.status.success() => {
+                let line = format!("registered `{DOMAIN}` -> {REDIRECT_IP}");
+                info!("{line}");
+                if let Some(sink) = log_sink {
+                    let _ = sink
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line,
+                        })
+                        .await;
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let line = format!(
+                    "could not register `{DOMAIN}` (exit {}): {}; host-service access via that hostname will not work until `sudo {}` runs",
+                    out.status.code().unwrap_or(-1),
+                    stderr.trim(),
+                    inner
+                );
+                warn!("{line}");
+                if let Some(sink) = log_sink {
+                    let _ = sink
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line,
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                let line = format!("could not invoke osascript to register `{DOMAIN}`: {e}");
+                warn!("{line}");
+                if let Some(sink) = log_sink {
+                    let _ = sink
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line,
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// Resolve `name` to an absolute path by consulting `which` in the
+/// running process's `$PATH`. Returns `None` if the binary is not on
+/// `$PATH` or `which` fails. Used by [`AppleContainersRuntime::
+/// ensure_host_internal_dns`] because the GUI shell launched by
+/// `osascript … with administrator privileges` does not inherit our
+/// `$PATH` and can't find Homebrew-installed tools by bare name.
+fn resolve_absolute_binary(name: &str) -> Option<String> {
+    if std::path::Path::new(name).is_absolute() {
+        return Some(name.to_string());
+    }
+    let out = std::process::Command::new("/usr/bin/which")
+        .arg(name)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let path = s.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
     }
 }
 
@@ -120,6 +302,11 @@ impl ContainerRuntime for AppleContainersRuntime {
         log_sink: Option<mpsc::Sender<LogChunk>>,
     ) -> Result<(), ContainerRuntimeError> {
         if self.system_ready.load(Ordering::Relaxed) {
+            // Already up in this process — but still make sure the
+            // `host.docker.internal` DNS domain registration has been
+            // attempted at least once. The helper short-circuits on its
+            // own atomic flag so we don't keep re-prompting.
+            self.ensure_host_internal_dns(log_sink.as_ref()).await;
             return Ok(());
         }
         // `container system status` is the cheapest probe: it prints a
@@ -133,6 +320,7 @@ impl ContainerRuntime for AppleContainersRuntime {
         };
         if cli::system_status_is_running(&status_text) {
             self.system_ready.store(true, Ordering::Relaxed);
+            self.ensure_host_internal_dns(log_sink.as_ref()).await;
             return Ok(());
         }
         if let Some(sink) = &log_sink {
@@ -154,6 +342,15 @@ impl ContainerRuntime for AppleContainersRuntime {
                 .await;
         }
         self.system_ready.store(true, Ordering::Relaxed);
+        // Best-effort: register the `host.docker.internal` DNS domain
+        // so containers can reach host services on `127.0.0.1`. This
+        // requires admin privileges (the underlying `container system
+        // dns create` writes to `/etc/resolver/` and reloads
+        // mDNSResponder), so we use osascript to surface a single
+        // GUI auth prompt. If it fails or the user cancels we log a
+        // warning and continue — host networking still works for
+        // every other purpose.
+        self.ensure_host_internal_dns(log_sink.as_ref()).await;
         Ok(())
     }
 
