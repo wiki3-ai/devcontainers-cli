@@ -3,17 +3,18 @@
 //! Layering (mirrors `wiki3-ai/wiki3-app`):
 //!   1. App shell        — [`run`] sets up windows and the Tauri builder.
 //!   2. Host layer       — [`host`] (config, permissions, persistent state, menu).
-//!   3. Container engine — [`container`] (runtime trait + Apple Containers /
-//!      Podman / Docker impls) and [`devcontainer`] (spec → ContainerSpec
-//!      translation, lifecycle orchestration).
+//!   3. Container engine — the reusable [`devcontainer_core`] crate
+//!      (runtime trait + Apple Containers / Podman / Docker impls,
+//!      `devcontainer.json` translation, lifecycle orchestration).
 //!   4. PTY              — [`pty`] (terminal hookup for the WebView).
 //!   5. Commands         — [`commands`] (Tauri command surface).
+//!   6. [`tauri_sink`]   — `EventSink` impl bridging the orchestrator to
+//!      the Tauri event bus.
 
 pub mod commands;
-pub mod container;
-pub mod devcontainer;
 pub mod host;
 pub mod pty;
+pub mod tauri_sink;
 
 use tracing_subscriber::EnvFilter;
 
@@ -27,8 +28,8 @@ pub fn run() {
         .init();
 
     let host_state = host::HostState::load().unwrap_or_default();
-    let runtime_registry = container::RuntimeRegistry::with_default_backends();
-    let orchestrator = devcontainer::lifecycle::LifecycleOrchestrator::new();
+    let runtime_registry = devcontainer_core::RuntimeRegistry::with_default_backends();
+    let orchestrator = devcontainer_core::LifecycleOrchestrator::new();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

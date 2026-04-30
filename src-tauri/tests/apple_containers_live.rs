@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use devcontainers_app_lib::container::{
+use devcontainer_core::container::{
     apple_containers::AppleContainersRuntime, ContainerRuntime, ContainerRuntimeError,
     ContainerSpec, ContainerState, ExecOptions, ImageRef, LogOptions,
 };

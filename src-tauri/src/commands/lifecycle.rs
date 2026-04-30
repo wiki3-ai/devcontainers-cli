@@ -1,16 +1,16 @@
 //! Container lifecycle commands. Each one resolves the workspace, picks
 //! the selected runtime, and delegates to the
-//! [`crate::devcontainer::lifecycle::LifecycleOrchestrator`].
+//! [`devcontainer_core::LifecycleOrchestrator`].
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
-use crate::container::RuntimeRegistry;
-use crate::devcontainer::lifecycle::{LifecycleOrchestrator, LifecycleStatus};
-use crate::devcontainer::translate::ParsedDevContainer;
 use crate::host::HostState;
+use devcontainer_core::{
+    LifecycleOrchestrator, LifecycleStatus, ParsedDevContainer, RuntimeRegistry,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,7 +91,12 @@ pub async fn container_up(
 ) -> Result<ContainerStatusDto, String> {
     let path = resolve_workspace(&state, &workspace_id)?;
     orchestrator
-        .up(&app, &registry, &workspace_id, &path)
+        .up_with_sink(
+            &crate::tauri_sink::TauriSink(&app),
+            &registry,
+            &workspace_id,
+            &path,
+        )
         .await
         .map(ContainerStatusDto::from)
         .map_err(|e| e.to_string())
@@ -107,7 +112,11 @@ pub async fn container_stop(
 ) -> Result<ContainerStatusDto, String> {
     resolve_workspace(&state, &workspace_id)?;
     orchestrator
-        .stop(&app, &registry, &workspace_id)
+        .stop_with_sink(
+            &crate::tauri_sink::TauriSink(&app),
+            &registry,
+            &workspace_id,
+        )
         .await
         .map(ContainerStatusDto::from)
         .map_err(|e| e.to_string())
@@ -123,7 +132,12 @@ pub async fn container_rebuild(
 ) -> Result<ContainerStatusDto, String> {
     let path = resolve_workspace(&state, &workspace_id)?;
     orchestrator
-        .rebuild(&app, &registry, &workspace_id, &path)
+        .rebuild_with_sink(
+            &crate::tauri_sink::TauriSink(&app),
+            &registry,
+            &workspace_id,
+            &path,
+        )
         .await
         .map(ContainerStatusDto::from)
         .map_err(|e| e.to_string())
@@ -139,7 +153,11 @@ pub async fn container_remove(
 ) -> Result<ContainerStatusDto, String> {
     resolve_workspace(&state, &workspace_id)?;
     orchestrator
-        .remove(&app, &registry, &workspace_id)
+        .remove_with_sink(
+            &crate::tauri_sink::TauriSink(&app),
+            &registry,
+            &workspace_id,
+        )
         .await
         .map(ContainerStatusDto::from)
         .map_err(|e| e.to_string())

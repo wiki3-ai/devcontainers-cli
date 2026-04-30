@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use devcontainers_app_lib::container::{
+use devcontainer_core::container::{
     apple_containers::AppleContainersRuntime, ContainerRuntime, ContainerSpec, ContainerState,
     ExecOptions, ImageRef,
 };

@@ -15,17 +15,17 @@
 //! lifecycle commands in `crate::commands::lifecycle` are thin wrappers
 //! around the methods on this struct.
 //!
-//! All event emission is funnelled through [`EventSink`] so the orchestrator
-//! body can be unit-tested without a real `tauri::AppHandle`.
+//! All event emission is funnelled through
+//! [`crate::events::EventSink`] so the orchestrator body can be
+//! unit-tested without a real Tauri app, and so sibling apps can
+//! provide their own emission impls.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -37,6 +37,7 @@ use crate::container::{
 use crate::devcontainer::translate::{
     parse_image_ref, to_container_spec, DevContainerBuild, LifecycleCommand, ParsedDevContainer,
 };
+use crate::events::EventSink;
 
 /// Label key under which the orchestrator stamps the configuration
 /// fingerprint on every built image and created container. Reading it
@@ -154,66 +155,6 @@ impl From<ContainerRuntimeError> for LifecycleError {
 
 fn stage<T>(stage: &'static str, r: Result<T, ContainerRuntimeError>) -> Result<T, LifecycleError> {
     r.map_err(|source| LifecycleError::Stage { stage, source })
-}
-
-/// Emission seam used by the orchestrator. Production code uses
-/// [`TauriSink`]; tests use an in-memory [`CapturingSink`].
-pub trait EventSink: Send + Sync {
-    fn status(
-        &self,
-        workspace_id: &str,
-        state: &str,
-        container_id: Option<&str>,
-        image_ref: Option<&str>,
-        error: Option<&str>,
-    );
-    fn log(&self, workspace_id: &str, stream: LogStreamKind, line: &str);
-}
-
-/// Default sink that forwards events to the running Tauri app.
-pub struct TauriSink<'a>(pub &'a AppHandle);
-
-impl EventSink for TauriSink<'_> {
-    fn status(
-        &self,
-        workspace_id: &str,
-        state: &str,
-        container_id: Option<&str>,
-        image_ref: Option<&str>,
-        error: Option<&str>,
-    ) {
-        let _ = self.0.emit(
-            "devcontainer://status",
-            StatusEvent {
-                workspace_id,
-                state,
-                container_id,
-                image_ref,
-                error,
-            },
-        );
-    }
-
-    fn log(&self, workspace_id: &str, stream: LogStreamKind, line: &str) {
-        let stream_str = match stream {
-            LogStreamKind::Stdout => "stdout",
-            LogStreamKind::Stderr => "stderr",
-            LogStreamKind::System => "system",
-        };
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let _ = self.0.emit(
-            "devcontainer://log",
-            LogEvent {
-                workspace_id,
-                stream: stream_str,
-                line,
-                ts,
-            },
-        );
-    }
 }
 
 /// Snapshot of a workspace's container state as exposed to the WebView.
@@ -460,19 +401,6 @@ impl LifecycleOrchestrator {
         let slot = map.entry(workspace_id.to_string()).or_default();
         slot.last_state = Some("error");
         slot.last_error = Some(message.to_string());
-    }
-
-    /// Public entry point used by `container_up`. Wraps [`Self::up_with_sink`]
-    /// with a [`TauriSink`].
-    pub async fn up(
-        &self,
-        app: &AppHandle,
-        registry: &RuntimeRegistry,
-        workspace_id: &str,
-        host_workspace: &Path,
-    ) -> Result<LifecycleStatus, LifecycleError> {
-        self.up_with_sink(&TauriSink(app), registry, workspace_id, host_workspace)
-            .await
     }
 
     /// Drive `pull → create → start` and run the post-create/start/attach
@@ -893,16 +821,6 @@ impl LifecycleOrchestrator {
         })
     }
 
-    pub async fn stop(
-        &self,
-        app: &AppHandle,
-        registry: &RuntimeRegistry,
-        workspace_id: &str,
-    ) -> Result<LifecycleStatus, LifecycleError> {
-        self.stop_with_sink(&TauriSink(app), registry, workspace_id)
-            .await
-    }
-
     pub async fn stop_with_sink(
         &self,
         sink: &dyn EventSink,
@@ -966,16 +884,6 @@ impl LifecycleOrchestrator {
             self.record_state(workspace_id, "absent", None, None);
         }
         Ok(self.snapshot(workspace_id))
-    }
-
-    pub async fn remove(
-        &self,
-        app: &AppHandle,
-        registry: &RuntimeRegistry,
-        workspace_id: &str,
-    ) -> Result<LifecycleStatus, LifecycleError> {
-        self.remove_with_sink(&TauriSink(app), registry, workspace_id)
-            .await
     }
 
     pub async fn remove_with_sink(
@@ -1045,17 +953,6 @@ impl LifecycleOrchestrator {
             sink.status(workspace_id, "absent", None, None, None);
         }
         Ok(self.snapshot(workspace_id))
-    }
-
-    pub async fn rebuild(
-        &self,
-        app: &AppHandle,
-        registry: &RuntimeRegistry,
-        workspace_id: &str,
-        host_workspace: &Path,
-    ) -> Result<LifecycleStatus, LifecycleError> {
-        self.rebuild_with_sink(&TauriSink(app), registry, workspace_id, host_workspace)
-            .await
     }
 
     pub async fn rebuild_with_sink(
@@ -1291,25 +1188,6 @@ async fn run_hook(
         });
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StatusEvent<'a> {
-    workspace_id: &'a str,
-    state: &'a str,
-    container_id: Option<&'a str>,
-    image_ref: Option<&'a str>,
-    error: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LogEvent<'a> {
-    workspace_id: &'a str,
-    stream: &'a str,
-    line: &'a str,
-    ts: u128,
 }
 
 /// `devcontainer.json` lifecycle hook identifier. Re-exported from the

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::container::{ContainerState, RuntimeId, RuntimeRegistry};
+use devcontainer_core::{ContainerState, RuntimeId, RuntimeRegistry};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RuntimeInfoDto {

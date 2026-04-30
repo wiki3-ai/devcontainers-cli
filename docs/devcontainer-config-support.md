@@ -2,8 +2,8 @@
 
 This doc tracks what the Devcontainers.app host actually understands today,
 and how it maps each top-level field onto the Apple `container` CLI. Keep
-it in sync with [src-tauri/src/devcontainer/translate.rs](../src-tauri/src/devcontainer/translate.rs)
-and [src-tauri/src/devcontainer/lifecycle.rs](../src-tauri/src/devcontainer/lifecycle.rs).
+it in sync with [src-tauri/crates/devcontainer-core/src/devcontainer/translate.rs](../src-tauri/crates/devcontainer-core/src/devcontainer/translate.rs)
+and [src-tauri/crates/devcontainer-core/src/devcontainer/lifecycle.rs](../src-tauri/crates/devcontainer-core/src/devcontainer/lifecycle.rs).
 
 ## Container model: one container per repo
 
@@ -204,7 +204,7 @@ same events.
 
 ## Tests guarding this behavior
 
-In [src-tauri/src/devcontainer/lifecycle.rs](../src-tauri/src/devcontainer/lifecycle.rs) `mod tests`:
+In [src-tauri/crates/devcontainer-core/src/devcontainer/lifecycle.rs](../src-tauri/crates/devcontainer-core/src/devcontainer/lifecycle.rs) `mod tests`:
 
 - `up_emits_pulling_creating_running_in_order` — happy path for `image`.
 - `up_pull_failure_surfaces_error_status_and_log` — pull failure path.
@@ -217,7 +217,7 @@ In [src-tauri/src/devcontainer/lifecycle.rs](../src-tauri/src/devcontainer/lifec
 - `up_with_compose_config_reports_unsupported_error` — compose rejection
   message stays stable.
 
-In [src-tauri/src/container/apple_containers/cli.rs](../src-tauri/src/container/apple_containers/cli.rs):
+In [src-tauri/crates/devcontainer-core/src/container/apple_containers/cli.rs](../src-tauri/crates/devcontainer-core/src/container/apple_containers/cli.rs):
 
 - `build_args_*` tests pin the exact argv ordering for `container build`,
   including deterministic `--build-arg` sort order.

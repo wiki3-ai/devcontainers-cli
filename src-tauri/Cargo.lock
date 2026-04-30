@@ -561,11 +561,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcontainer-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "devcontainers-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "devcontainer-core",
  "dirs 5.0.1",
  "hex",
  "once_cell",
