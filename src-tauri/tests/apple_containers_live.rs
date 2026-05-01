@@ -40,6 +40,7 @@ fn exec_opts(cmd: &[&str]) -> ExecOptions {
         env: Default::default(),
         user: None,
         tty: false,
+        ..Default::default()
     }
 }
 

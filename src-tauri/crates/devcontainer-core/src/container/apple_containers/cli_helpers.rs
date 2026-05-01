@@ -73,32 +73,31 @@ pub fn detect() -> AppleContainerStatus {
 /// is running. Runs `container system start` which is idempotent —
 /// it's a no-op if the service is already up.
 ///
-/// On first start Apple Container prompts on stdin to download its
-/// default Kata kernel. We auto-accept by feeding `y\n`; the
-/// alternative (failing with "failed to read user input") leaves the
-/// service half-initialized and unusable.
+/// On first start Apple Container needs to install its default Kata
+/// kernel; without an answer it prompts on the controlling TTY and
+/// fails with "failed to read user input" when launched from a GUI
+/// app (no TTY attached). We pass `--enable-kernel-install` to
+/// non-interactively accept the install — the alternative leaves the
+/// service half-initialized and subsequent `container build` calls
+/// fail with "default kernel not configured for architecture arm64".
 ///
-/// On first start Apple may also show a system authorization prompt
-/// (sometimes several seconds), and the kernel download itself can
-/// take a while, so we impose a generous timeout.
+/// The kernel download plus a possible system authorization prompt
+/// (sometimes several seconds) can take a while, so we impose a
+/// generous timeout.
 pub async fn ensure_service_running(container_bin: &Path) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     let mut cmd = Command::new(container_bin);
-    cmd.arg("system").arg("start");
+    cmd.arg("system")
+        .arg("start")
+        .arg("--enable-kernel-install");
 
-    let mut child = cmd
-        .stdin(std::process::Stdio::piped())
+    let child = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn `container system start`: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(b"y\n").await;
-        drop(stdin);
-    }
 
     let output = tokio::time::timeout(Duration::from_secs(600), child.wait_with_output())
         .await
@@ -111,6 +110,70 @@ pub async fn ensure_service_running(container_bin: &Path) -> Result<(), String> 
             output.status.code(),
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout),
+        ));
+    }
+
+    // Belt-and-suspenders: if the user previously ran `container
+    // system start` interactively and answered "no" (or the prompt
+    // failed and the service started anyway with no kernel), the
+    // service is up but builds will fail with "default kernel not
+    // configured for architecture <arch>". `container system start`
+    // is then a no-op — it won't retry the install. Detect that
+    // state and run `container system kernel set --recommended` to
+    // self-heal without bouncing out to the command line.
+    if !default_kernel_installed() {
+        ensure_default_kernel(container_bin).await?;
+    }
+    Ok(())
+}
+
+/// Detect whether Apple Container has a default kernel configured for
+/// the current architecture. Apple Container stores kernels under
+/// `~/Library/Application Support/com.apple.container/kernels/` keyed
+/// by arch (`default.kernel-arm64` / `default.kernel-amd64`).
+fn default_kernel_installed() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return true; // can't tell — don't second-guess
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else {
+        return true; // unknown arch — let the CLI decide
+    };
+    let path = PathBuf::from(home)
+        .join("Library/Application Support/com.apple.container/kernels")
+        .join(format!("default.kernel-{arch}"));
+    path.exists()
+}
+
+/// Run `container system kernel set --recommended` to install Apple
+/// Container's recommended default kernel non-interactively. Used to
+/// recover from a half-initialised state where the service is up but
+/// no default kernel is configured.
+async fn ensure_default_kernel(container_bin: &Path) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let fut = Command::new(container_bin)
+        .arg("system")
+        .arg("kernel")
+        .arg("set")
+        .arg("--recommended")
+        .stdin(std::process::Stdio::null())
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(600), fut)
+        .await
+        .map_err(|_| {
+            "`container system kernel set --recommended` timed out after 10 minutes".to_string()
+        })?
+        .map_err(|e| format!("spawn `container system kernel set`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`container system kernel set --recommended` failed (exit {:?}):\n--- stderr ---\n{}\n--- stdout ---\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout),
         ));
     }
     Ok(())

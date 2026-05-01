@@ -2401,8 +2401,8 @@ mod tests {
             Some("http://corp.proxy:8080")
         );
         // Internal NO_PROXY default is NOT injected when host wins.
-        assert!(env.get("NO_PROXY").is_none());
-        assert!(env.get("no_proxy").is_none());
+        assert!(!env.contains_key("NO_PROXY"));
+        assert!(!env.contains_key("no_proxy"));
     }
 
     #[test]
