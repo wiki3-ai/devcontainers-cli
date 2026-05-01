@@ -197,6 +197,15 @@ const INTERNAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,192.168.64.1";
 /// URL is injected as `HTTP_PROXY` + `HTTPS_PROXY` + a sensible
 /// `NO_PROXY`. If the host is unset *and* the internal URL is
 /// `None`, the result is empty.
+///
+/// For every populated variable we emit *both* the uppercase
+/// (`HTTP_PROXY`) and lowercase (`http_proxy`) form. BuildKit's
+/// predeclared proxy build-args are uppercase-only, but tools at
+/// runtime — `curl`, `wget`, `pip`, `git`, many shell scripts —
+/// honour only the lowercase form, so the runtime container env
+/// path needs both. Callers that only want one case (e.g. the
+/// build-args path via [`merge_proxy_build_args`]) iterate the
+/// uppercase canonical list and ignore the rest.
 pub(crate) fn compute_effective_proxy_env<F>(
     mut host_env: F,
     internal_url: Option<String>,
@@ -206,20 +215,31 @@ where
 {
     let mut out = HashMap::new();
     let mut host_set = false;
+    let mut insert_both = |name: &str, value: String| {
+        out.insert(name.to_ascii_uppercase(), value.clone());
+        out.insert(name.to_ascii_lowercase(), value);
+    };
     for name in PROXY_VAR_NAMES {
         let v = host_env(name)
             .or_else(|| host_env(&name.to_ascii_lowercase()))
             .filter(|v| !v.is_empty());
         if let Some(v) = v {
             host_set = true;
-            out.insert((*name).to_string(), rewrite_localhost_to_host_gateway(&v));
+            insert_both(name, rewrite_localhost_to_host_gateway(&v));
         }
     }
     if !host_set {
         if let Some(url) = internal_url {
-            out.insert("HTTP_PROXY".into(), url.clone());
-            out.insert("HTTPS_PROXY".into(), url);
-            out.insert("NO_PROXY".into(), INTERNAL_PROXY_NO_PROXY.into());
+            // Loopback rewrite for symmetry with the host-supplied
+            // path. In production the manager binds on the bridge
+            // gateway already, so this is a no-op; in tests that
+            // bind on `127.0.0.1` (and conceivably for the Phase 4
+            // launchd shared service) it keeps the URL reachable
+            // from inside the container.
+            let url = rewrite_localhost_to_host_gateway(&url);
+            insert_both("HTTP_PROXY", url.clone());
+            insert_both("HTTPS_PROXY", url);
+            insert_both("NO_PROXY", INTERNAL_PROXY_NO_PROXY.into());
         }
     }
     if !out.is_empty() {
@@ -942,9 +962,14 @@ impl LifecycleOrchestrator {
         let mut spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
         // Forward proxy env vars into the container so that lifecycle
         // hooks (e.g. `postCreateCommand: pip install ...`) can reach
-        // the network. Explicit entries in `containerEnv`/`remoteEnv`
-        // win over both host and internal-proxy values.
-        spec.env = merge_proxy_build_args(spec.env, |n| proxy_env.get(n).cloned());
+        // the network. We inject *both* `HTTP_PROXY` and `http_proxy`
+        // forms because tools like `curl`, `wget`, `pip`, and `git`
+        // only honour the lowercase variants. Explicit entries in
+        // `containerEnv` / `remoteEnv` win over both host and
+        // internal-proxy values.
+        for (k, v) in &proxy_env {
+            spec.env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
         if let Some(h) = config_hash.as_deref() {
             spec.labels
                 .insert(LABEL_CONFIG_HASH.to_string(), h.to_string());
@@ -2340,6 +2365,20 @@ mod tests {
             env.get("NO_PROXY").map(String::as_str),
             Some(INTERNAL_PROXY_NO_PROXY)
         );
+        // Lowercase variants are emitted alongside uppercase so
+        // curl / wget / pip / git see them too.
+        assert_eq!(
+            env.get("http_proxy").map(String::as_str),
+            Some("http://192.168.64.1:31280")
+        );
+        assert_eq!(
+            env.get("https_proxy").map(String::as_str),
+            Some("http://192.168.64.1:31280")
+        );
+        assert_eq!(
+            env.get("no_proxy").map(String::as_str),
+            Some(INTERNAL_PROXY_NO_PROXY)
+        );
     }
 
     #[test]
@@ -2354,8 +2393,14 @@ mod tests {
             Some("http://corp.proxy:8080"),
             "host-supplied proxy must win over internal"
         );
+        // Lowercase mirror is also emitted.
+        assert_eq!(
+            env.get("http_proxy").map(String::as_str),
+            Some("http://corp.proxy:8080")
+        );
         // Internal NO_PROXY default is NOT injected when host wins.
         assert!(env.get("NO_PROXY").is_none());
+        assert!(env.get("no_proxy").is_none());
     }
 
     #[test]
@@ -2462,14 +2507,23 @@ mod tests {
             Some(INTERNAL_PROXY_NO_PROXY)
         );
 
-        // ContainerSpec.env carries the same (rewritten) proxy.
+        // ContainerSpec.env carries the same (rewritten) proxy in
+        // both the uppercase form (BuildKit / most modern tools) and
+        // the lowercase form (curl, wget, pip, git, plain shell
+        // scripts).
         let creates = runtime.create_calls.lock().clone();
         assert_eq!(creates.len(), 1);
         let cs = &creates[0];
         assert_eq!(cs.env.get("HTTP_PROXY"), Some(&expected_in_spec));
         assert_eq!(cs.env.get("HTTPS_PROXY"), Some(&expected_in_spec));
+        assert_eq!(cs.env.get("http_proxy"), Some(&expected_in_spec));
+        assert_eq!(cs.env.get("https_proxy"), Some(&expected_in_spec));
         assert_eq!(
             cs.env.get("NO_PROXY").map(String::as_str),
+            Some(INTERNAL_PROXY_NO_PROXY)
+        );
+        assert_eq!(
+            cs.env.get("no_proxy").map(String::as_str),
             Some(INTERNAL_PROXY_NO_PROXY)
         );
     }
@@ -2507,7 +2561,8 @@ mod tests {
             "internal proxy must stay dormant when host provides one"
         );
 
-        // Container env carries the rewritten host value.
+        // Container env carries the rewritten host value in both
+        // cases — `curl`/`pip`/etc. need the lowercase form too.
         let creates = runtime.create_calls.lock().clone();
         assert_eq!(creates.len(), 1);
         let cs = &creates[0];
@@ -2515,6 +2570,11 @@ mod tests {
             cs.env.get("HTTP_PROXY").map(String::as_str),
             Some("http://192.168.64.1:3128"),
             "loopback in host proxy must be rewritten to bridge IP"
+        );
+        assert_eq!(
+            cs.env.get("http_proxy").map(String::as_str),
+            Some("http://192.168.64.1:3128"),
+            "lowercase variant must be injected for curl/pip/etc."
         );
     }
 
@@ -2547,10 +2607,24 @@ mod tests {
         o.set_host_env_override(HashMap::new());
 
         // Trigger the lazy bind via the same path `up` would use.
+        // The injected env URL gets the loopback→bridge rewrite, so
+        // we read the real listener address from the manager rather
+        // than from the env map (the rewritten URL is intentionally
+        // unreachable from this test process).
         let env = o.effective_proxy_env().await;
-        let proxy_url = env.get("HTTP_PROXY").cloned().expect("proxy URL injected");
-        let proxy_addr: std::net::SocketAddr =
-            proxy_url.strip_prefix("http://").unwrap().parse().unwrap();
+        assert_eq!(
+            env.get("HTTP_PROXY").map(String::as_str),
+            env.get("http_proxy").map(String::as_str),
+            "upper- and lowercase env vars must agree"
+        );
+        let proxy_addr = o
+            .proxy()
+            .url()
+            .expect("proxy URL injected")
+            .strip_prefix("http://")
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
 
         // Manually CONNECT through the proxy to the upstream.
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
