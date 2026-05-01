@@ -154,27 +154,44 @@ impl ContainerRuntime for AppleContainersRuntime {
             Ok((stdout, _)) => stdout,
             Err(_) => String::new(),
         };
-        if cli::system_status_is_running(&status_text) {
-            self.system_ready.store(true, Ordering::Relaxed);
-            return Ok(());
+        let already_running = cli::system_status_is_running(&status_text);
+        if !already_running {
+            if let Some(sink) = &log_sink {
+                let _ = sink
+                    .send(LogChunk {
+                        stream: LogStreamKind::System,
+                        line: "container system not running; starting…".into(),
+                    })
+                    .await;
+            }
         }
-        if let Some(sink) = &log_sink {
-            let _ = sink
-                .send(LogChunk {
-                    stream: LogStreamKind::System,
-                    line: "container system not running; starting…".into(),
-                })
-                .await;
-        }
-        info!(binary = self.cli.binary(), "starting container system");
-        run_capturing(&self.cli, ["system", "start"]).await?;
-        if let Some(sink) = &log_sink {
-            let _ = sink
-                .send(LogChunk {
-                    stream: LogStreamKind::System,
-                    line: "container system started".into(),
-                })
-                .await;
+        info!(
+            binary = self.cli.binary(),
+            already_running, "ensuring container system + default kernel"
+        );
+        // Delegate to the shared helper so we get:
+        //   * `--enable-kernel-install` (avoids the "failed to read user
+        //     input" first-run failure when launched from a GUI app
+        //     with no controlling TTY), and
+        //   * a self-heal pass that runs `container system kernel set
+        //     --recommended` if the default kernel is still missing —
+        //     covers users left in the half-initialised state by
+        //     earlier app builds.
+        // The helper is idempotent and cheap when everything is
+        // already in place, so it's fine to run on every cold cache
+        // hit (we still gate on `system_ready` above).
+        cli_helpers::ensure_service_running(std::path::Path::new(self.cli.binary()))
+            .await
+            .map_err(ContainerRuntimeError::Backend)?;
+        if !already_running {
+            if let Some(sink) = &log_sink {
+                let _ = sink
+                    .send(LogChunk {
+                        stream: LogStreamKind::System,
+                        line: "container system started".into(),
+                    })
+                    .await;
+            }
         }
         self.system_ready.store(true, Ordering::Relaxed);
         Ok(())
