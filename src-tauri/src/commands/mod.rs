@@ -3,5 +3,6 @@
 
 pub mod fs;
 pub mod lifecycle;
+pub mod proxy;
 pub mod runtime;
 pub mod workspace;

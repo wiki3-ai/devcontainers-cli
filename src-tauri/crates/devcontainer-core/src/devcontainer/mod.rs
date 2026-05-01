@@ -4,4 +4,5 @@
 //! the selected [`crate::container::ContainerRuntime`].
 
 pub mod lifecycle;
+pub mod proxy_manager;
 pub mod translate;

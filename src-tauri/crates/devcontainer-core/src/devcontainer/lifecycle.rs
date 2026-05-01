@@ -181,6 +181,59 @@ const PROXY_VAR_NAMES: &[&str] = &[
 /// for the default bridge with `.1` as the gateway.
 const HOST_BRIDGE_GATEWAY_IP: &str = "192.168.64.1";
 
+/// `NO_PROXY` value used when the internal proxy is auto-injected.
+/// Bypasses the proxy for localhost, IPv6 loopback, and the bridge
+/// gateway itself so containers can still talk directly to host
+/// services and to each other.
+const INTERNAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,192.168.64.1";
+
+/// Compute the effective proxy env for an `up`, given a host-env
+/// source and an optional internal-proxy URL. Pure function; the
+/// orchestrator wraps this with `std::env::var` and the lazy proxy
+/// start. Tests use it directly to avoid mutating global env.
+///
+/// Precedence: any host-supplied proxy var wins (with loopback
+/// rewriting). If the host has no proxy var set at all, the internal
+/// URL is injected as `HTTP_PROXY` + `HTTPS_PROXY` + a sensible
+/// `NO_PROXY`. If the host is unset *and* the internal URL is
+/// `None`, the result is empty.
+pub(crate) fn compute_effective_proxy_env<F>(
+    mut host_env: F,
+    internal_url: Option<String>,
+) -> HashMap<String, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut out = HashMap::new();
+    let mut host_set = false;
+    for name in PROXY_VAR_NAMES {
+        let v = host_env(name)
+            .or_else(|| host_env(&name.to_ascii_lowercase()))
+            .filter(|v| !v.is_empty());
+        if let Some(v) = v {
+            host_set = true;
+            out.insert((*name).to_string(), rewrite_localhost_to_host_gateway(&v));
+        }
+    }
+    if !host_set {
+        if let Some(url) = internal_url {
+            out.insert("HTTP_PROXY".into(), url.clone());
+            out.insert("HTTPS_PROXY".into(), url);
+            out.insert("NO_PROXY".into(), INTERNAL_PROXY_NO_PROXY.into());
+        }
+    }
+    if !out.is_empty() {
+        tracing::info!(
+            source = if host_set { "host" } else { "internal" },
+            http_proxy = out.get("HTTP_PROXY").map(String::as_str).unwrap_or(""),
+            "proxy: effective env for up"
+        );
+    } else {
+        tracing::debug!("proxy: no effective env (host unset, internal disabled)");
+    }
+    out
+}
+
 /// Merge proxy environment variables (HTTP_PROXY etc.) into a
 /// build-args map. Each name is looked up via `lookup` in both upper-
 /// and lower-case forms; the first non-empty value wins. Existing
@@ -299,12 +352,25 @@ pub struct LifecycleOrchestrator {
     /// Per-workspace tokio mutex serialising mutating commands. Held across
     /// awaits so we use `tokio::sync::Mutex` rather than `parking_lot`.
     locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// Lazy-started internal forward proxy. When the host has no
+    /// `HTTP_PROXY` of its own, this manager's bound URL is injected
+    /// into containers' env at `up` time so package managers route
+    /// through it. Defaults to disabled (tests + headless callers);
+    /// production callers construct via [`Self::with_proxy`].
+    proxy: Arc<crate::devcontainer::proxy_manager::ProxyManager>,
+    /// Optional in-memory override of the host environment. When
+    /// `Some`, [`Self::effective_proxy_env`] looks up proxy vars
+    /// here instead of via `std::env::var`. Used by integration tests
+    /// to avoid racing on process-global state. Production never
+    /// touches this.
+    host_env_override: RwLock<Option<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for LifecycleOrchestrator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LifecycleOrchestrator")
             .field("workspaces", &self.slots.read().len())
+            .field("proxy", &self.proxy)
             .finish()
     }
 }
@@ -312,6 +378,68 @@ impl std::fmt::Debug for LifecycleOrchestrator {
 impl LifecycleOrchestrator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct an orchestrator wired to the given proxy manager.
+    /// Use [`crate::devcontainer::proxy_manager::ProxyManager::with_apple_containers_default`]
+    /// for the standard `192.168.64.1:31280` bind.
+    pub fn with_proxy(proxy: crate::devcontainer::proxy_manager::ProxyManager) -> Self {
+        Self {
+            proxy: Arc::new(proxy),
+            ..Self::default()
+        }
+    }
+
+    /// Access the lazy-started proxy manager. Useful for the UI
+    /// status pill and "flush cache" command.
+    pub fn proxy(&self) -> &Arc<crate::devcontainer::proxy_manager::ProxyManager> {
+        &self.proxy
+    }
+
+    /// Resolve the proxy env vars (`HTTP_PROXY` etc.) that should be
+    /// merged into builds and containers for this `up`.
+    ///
+    /// Precedence: any host env var the user already set wins. If the
+    /// host has *no* proxy set, we lazy-start the internal proxy and
+    /// fall back to its URL. If the internal proxy is disabled or its
+    /// bind failed, the resulting map is empty.
+    ///
+    /// Loopback hostnames in host-supplied URLs are rewritten to the
+    /// Apple Containers bridge gateway IP — see
+    /// [`rewrite_localhost_to_host_gateway`].
+    async fn effective_proxy_env(&self) -> HashMap<String, String> {
+        // Determine whether the host already has a proxy set before
+        // touching the internal proxy: starting it requires a tcp
+        // bind, and there's no point paying for that when the user
+        // (or their corporate config) already has one.
+        let override_map = self.host_env_override.read().clone();
+        let host_lookup = |n: &str| -> Option<String> {
+            match &override_map {
+                Some(m) => m.get(n).cloned(),
+                None => std::env::var(n).ok(),
+            }
+        };
+        let host_has_proxy = PROXY_VAR_NAMES.iter().any(|n| {
+            host_lookup(n).filter(|v| !v.is_empty()).is_some()
+                || host_lookup(&n.to_ascii_lowercase())
+                    .filter(|v| !v.is_empty())
+                    .is_some()
+        });
+        let internal_url = if host_has_proxy {
+            None
+        } else {
+            self.proxy.ensure_started().await
+        };
+        compute_effective_proxy_env(host_lookup, internal_url)
+    }
+
+    /// Test-only: install an in-memory map that replaces the process
+    /// environment for proxy-var lookups. The map is consulted with
+    /// the same name conventions as `std::env::var` (case-sensitive;
+    /// callers that want loose matching should populate both forms).
+    /// Pass an empty map to simulate "host has no proxy".
+    pub fn set_host_env_override(&self, env: HashMap<String, String>) {
+        *self.host_env_override.write() = Some(env);
     }
 
     /// Store the parsed config for `workspace_id`. Replaces any prior value.
@@ -599,10 +727,11 @@ impl LifecycleOrchestrator {
         host_workspace: &Path,
         parsed: &ParsedDevContainer,
         config_hash: Option<&str>,
+        proxy_env: &HashMap<String, String>,
     ) -> Result<ImageRef, LifecycleError> {
         if let Some(build) = parsed.build.as_ref() {
             let mut build_spec =
-                self.resolve_build_spec(workspace_id, host_workspace, parsed, build);
+                self.resolve_build_spec(workspace_id, host_workspace, parsed, build, proxy_env);
             if let Some(h) = config_hash {
                 build_spec
                     .labels
@@ -729,6 +858,7 @@ impl LifecycleOrchestrator {
         host_workspace: &Path,
         parsed: &ParsedDevContainer,
         build: &DevContainerBuild,
+        proxy_env: &HashMap<String, String>,
     ) -> BuildSpec {
         let cfg_dir: std::path::PathBuf = parsed
             .config_file_path
@@ -752,7 +882,7 @@ impl LifecycleOrchestrator {
             tag,
             context_dir,
             dockerfile,
-            build_args: merge_proxy_build_args(build.args.clone(), |n| std::env::var(n).ok()),
+            build_args: merge_proxy_build_args(build.args.clone(), |n| proxy_env.get(n).cloned()),
             target: build.target.clone(),
             labels: HashMap::new(),
         }
@@ -789,6 +919,13 @@ impl LifecycleOrchestrator {
         });
         let config_hash = compute_config_hash(&parsed, dockerfile_path.as_deref());
 
+        // Resolve the proxy env once for this `up`. Preferring host-
+        // configured proxies and falling back to the internal proxy
+        // is the same shape for both `container build` and the
+        // running container, so we compute the map once and use it
+        // in both places.
+        let proxy_env = self.effective_proxy_env().await;
+
         // Resolve the image: either pull a pre-built one, or build from a
         // Dockerfile. The result is the ImageRef we hand to `create`.
         let image_ref = self
@@ -799,17 +936,15 @@ impl LifecycleOrchestrator {
                 host_workspace,
                 &parsed,
                 config_hash.as_deref(),
+                &proxy_env,
             )
             .await?;
         let mut spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
-        // Forward host proxy env vars into the container so that
-        // lifecycle hooks (e.g. `postCreateCommand: pip install ...`)
-        // can reach the network through a host-side proxy. Reuses the
-        // same loopback→bridge-gateway rewrite as the build path so
-        // `http://localhost:3128` on the host becomes
-        // `http://192.168.64.1:3128` inside the container. Explicit
-        // entries in `containerEnv`/`remoteEnv` win.
-        spec.env = merge_proxy_build_args(spec.env, |n| std::env::var(n).ok());
+        // Forward proxy env vars into the container so that lifecycle
+        // hooks (e.g. `postCreateCommand: pip install ...`) can reach
+        // the network. Explicit entries in `containerEnv`/`remoteEnv`
+        // win over both host and internal-proxy values.
+        spec.env = merge_proxy_build_args(spec.env, |n| proxy_env.get(n).cloned());
         if let Some(h) = config_hash.as_deref() {
             spec.labels
                 .insert(LABEL_CONFIG_HASH.to_string(), h.to_string());
@@ -1714,6 +1849,7 @@ mod tests {
     struct FakeRuntime {
         script: PlMutex<FakeScript>,
         build_calls: PlMutex<Vec<crate::container::BuildSpec>>,
+        create_calls: PlMutex<Vec<crate::container::ContainerSpec>>,
     }
 
     impl FakeRuntime {
@@ -1721,6 +1857,7 @@ mod tests {
             Self {
                 script: PlMutex::new(script),
                 build_calls: PlMutex::new(Vec::new()),
+                create_calls: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -1765,8 +1902,9 @@ mod tests {
         }
         async fn create(
             &self,
-            _spec: &crate::container::ContainerSpec,
+            spec: &crate::container::ContainerSpec,
         ) -> Result<String, ContainerRuntimeError> {
+            self.create_calls.lock().push(spec.clone());
             if let Some(e) = self.script.lock().create_err.take() {
                 return Err(ContainerRuntimeError::Backend(e));
             }
@@ -2183,5 +2321,310 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    // -------- proxy: pure precedence/rewriting logic --------
+
+    #[test]
+    fn compute_effective_proxy_env_uses_internal_when_host_unset() {
+        let env = compute_effective_proxy_env(|_| None, Some("http://192.168.64.1:31280".into()));
+        assert_eq!(
+            env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://192.168.64.1:31280")
+        );
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://192.168.64.1:31280")
+        );
+        assert_eq!(
+            env.get("NO_PROXY").map(String::as_str),
+            Some(INTERNAL_PROXY_NO_PROXY)
+        );
+    }
+
+    #[test]
+    fn compute_effective_proxy_env_prefers_host_proxy_over_internal() {
+        let host: HashMap<&str, &str> = [("HTTP_PROXY", "http://corp.proxy:8080")].into();
+        let env = compute_effective_proxy_env(
+            |n| host.get(n).map(|s| s.to_string()),
+            Some("http://192.168.64.1:31280".into()),
+        );
+        assert_eq!(
+            env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://corp.proxy:8080"),
+            "host-supplied proxy must win over internal"
+        );
+        // Internal NO_PROXY default is NOT injected when host wins.
+        assert!(env.get("NO_PROXY").is_none());
+    }
+
+    #[test]
+    fn compute_effective_proxy_env_rewrites_loopback_in_host_value() {
+        let host: HashMap<&str, &str> = [("HTTP_PROXY", "http://localhost:3128")].into();
+        let env = compute_effective_proxy_env(|n| host.get(n).map(|s| s.to_string()), None);
+        assert_eq!(
+            env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://192.168.64.1:3128"),
+            "loopback must be rewritten to bridge gateway IP"
+        );
+    }
+
+    #[test]
+    fn compute_effective_proxy_env_empty_when_host_unset_and_internal_disabled() {
+        let env = compute_effective_proxy_env(|_| None, None);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn compute_effective_proxy_env_falls_back_to_lowercase_host_var() {
+        let host: HashMap<&str, &str> = [("http_proxy", "http://corp:8080")].into();
+        let env = compute_effective_proxy_env(
+            |n| host.get(n).map(|s| s.to_string()),
+            Some("http://192.168.64.1:31280".into()),
+        );
+        assert_eq!(
+            env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://corp:8080")
+        );
+    }
+
+    // -------- proxy: end-to-end through the orchestrator --------
+
+    /// Internal proxy URL is auto-injected into both build args and
+    /// runtime container env when the host has no proxy set.
+    /// Exercised against a real `ProxyManager` bound on an ephemeral
+    /// loopback port.
+    #[tokio::test]
+    async fn up_with_internal_proxy_injects_env_into_build_args_and_container_env() {
+        // Bind the proxy on an ephemeral loopback port so the test
+        // is independent of whether the Apple Containers bridge is
+        // up. Port 0 → kernel chooses a free port → manager records
+        // the actual URL we'll see in the spec.
+        let proxy = crate::devcontainer::proxy_manager::ProxyManager::with_bind(
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let o = LifecycleOrchestrator::with_proxy(proxy);
+        // Force an empty host env so the internal proxy is the only
+        // source. Avoids races on process-global env.
+        o.set_host_env_override(HashMap::new());
+
+        // Build-based config so we exercise both code paths.
+        let cfg_dir = tempdir();
+        std::fs::create_dir_all(cfg_dir.join(".devcontainer")).unwrap();
+        let cfg_path = cfg_dir.join(".devcontainer/devcontainer.json");
+        std::fs::write(&cfg_path, b"{}").unwrap();
+        // Dockerfile content doesn't matter — FakeRuntime never reads it.
+        std::fs::write(cfg_dir.join(".devcontainer/Dockerfile"), b"FROM alpine\n").unwrap();
+        let parsed = ParsedDevContainer {
+            build: Some(DevContainerBuild {
+                dockerfile: Some("Dockerfile".into()),
+                context: Some(".".into()),
+                ..Default::default()
+            }),
+            config_file_path: Some(cfg_path),
+            ..Default::default()
+        };
+        o.set_parsed_config("ws", parsed);
+
+        let runtime = Arc::new(FakeRuntime::new(FakeScript::default()));
+        let registry = RuntimeRegistry::with_single(
+            RuntimeId::AppleContainers,
+            runtime.clone() as Arc<dyn ContainerRuntime>,
+        );
+        let sink = Arc::new(CapturingSink::default());
+
+        let status = o
+            .up_with_sink(sink, &registry, "ws", &cfg_dir)
+            .await
+            .expect("up should succeed");
+        assert_eq!(status.state, "running");
+
+        // Discover the URL the proxy actually bound on.
+        let proxy_url = o
+            .proxy()
+            .url()
+            .expect("proxy should have started lazily during up");
+        assert!(proxy_url.starts_with("http://127.0.0.1:"));
+        // The build/container injection path applies the standard
+        // loopback→bridge-IP rewrite — `127.0.0.1` is unreachable
+        // from inside a container, so the URL we expect to see in
+        // the spec swaps the host literal but keeps the port.
+        let expected_in_spec = proxy_url.replace("127.0.0.1", "192.168.64.1");
+
+        // BuildSpec.build_args carries the (rewritten) proxy.
+        let builds = runtime.build_calls.lock().clone();
+        assert_eq!(builds.len(), 1);
+        let bs = &builds[0];
+        assert_eq!(bs.build_args.get("HTTP_PROXY"), Some(&expected_in_spec));
+        assert_eq!(bs.build_args.get("HTTPS_PROXY"), Some(&expected_in_spec));
+        assert_eq!(
+            bs.build_args.get("NO_PROXY").map(String::as_str),
+            Some(INTERNAL_PROXY_NO_PROXY)
+        );
+
+        // ContainerSpec.env carries the same (rewritten) proxy.
+        let creates = runtime.create_calls.lock().clone();
+        assert_eq!(creates.len(), 1);
+        let cs = &creates[0];
+        assert_eq!(cs.env.get("HTTP_PROXY"), Some(&expected_in_spec));
+        assert_eq!(cs.env.get("HTTPS_PROXY"), Some(&expected_in_spec));
+        assert_eq!(
+            cs.env.get("NO_PROXY").map(String::as_str),
+            Some(INTERNAL_PROXY_NO_PROXY)
+        );
+    }
+
+    /// When the host already exports `HTTP_PROXY`, the internal
+    /// proxy stays dormant and the host value flows through (with
+    /// loopback rewriting) into both build args and container env.
+    #[tokio::test]
+    async fn up_with_host_proxy_set_does_not_start_internal_proxy() {
+        let proxy = crate::devcontainer::proxy_manager::ProxyManager::with_bind(
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let o = LifecycleOrchestrator::with_proxy(proxy);
+        let mut host = HashMap::new();
+        host.insert("HTTP_PROXY".into(), "http://localhost:3128".into());
+        host.insert("HTTPS_PROXY".into(), "http://localhost:3128".into());
+        o.set_host_env_override(host);
+
+        o.set_parsed_config("ws", parsed_with_image("ubuntu:24.04"));
+        let runtime = Arc::new(FakeRuntime::new(FakeScript::default()));
+        let registry = RuntimeRegistry::with_single(
+            RuntimeId::AppleContainers,
+            runtime.clone() as Arc<dyn ContainerRuntime>,
+        );
+        let sink = Arc::new(CapturingSink::default());
+
+        o.up_with_sink(sink, &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .await
+            .expect("up should succeed");
+
+        // Internal proxy should never have bound — host satisfied
+        // the requirement.
+        assert!(
+            o.proxy().url().is_none(),
+            "internal proxy must stay dormant when host provides one"
+        );
+
+        // Container env carries the rewritten host value.
+        let creates = runtime.create_calls.lock().clone();
+        assert_eq!(creates.len(), 1);
+        let cs = &creates[0];
+        assert_eq!(
+            cs.env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://192.168.64.1:3128"),
+            "loopback in host proxy must be rewritten to bridge IP"
+        );
+    }
+
+    /// End-to-end: orchestrator starts the proxy, an external
+    /// CONNECT round-trip succeeds, and stats reflect the traffic.
+    /// This is the "live integration" test for Phase 1: no
+    /// containers, but every layer of our proxy stack is exercised.
+    #[tokio::test]
+    async fn proxy_started_by_orchestrator_round_trips_connect_and_records_stats() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Tiny in-test "upstream": echoes a known banner then drains.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = upstream.accept().await {
+                let _ = s.write_all(b"HELLO\n").await;
+                let mut buf = [0u8; 64];
+                let _ = s.read(&mut buf).await;
+                let _ = s.shutdown().await;
+            }
+        });
+
+        // Orchestrator wired to a real proxy on an ephemeral port.
+        let proxy = crate::devcontainer::proxy_manager::ProxyManager::with_bind(
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let o = LifecycleOrchestrator::with_proxy(proxy);
+        o.set_host_env_override(HashMap::new());
+
+        // Trigger the lazy bind via the same path `up` would use.
+        let env = o.effective_proxy_env().await;
+        let proxy_url = env.get("HTTP_PROXY").cloned().expect("proxy URL injected");
+        let proxy_addr: std::net::SocketAddr =
+            proxy_url.strip_prefix("http://").unwrap().parse().unwrap();
+
+        // Manually CONNECT through the proxy to the upstream.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let req = format!(
+            "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n",
+            host = upstream_addr.ip(),
+            port = upstream_addr.port(),
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        // Read the proxy's "200 Connection established" + headers.
+        let mut head = Vec::with_capacity(128);
+        let mut tmp = [0u8; 256];
+        loop {
+            let n = client.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "proxy closed before sending response");
+            head.extend_from_slice(&tmp[..n]);
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head_str = String::from_utf8_lossy(&head);
+        assert!(
+            head_str.contains("200"),
+            "expected 200 from proxy, got: {head_str}"
+        );
+
+        // The bytes after the headers should include the upstream
+        // banner. Read more if we haven't seen it yet.
+        let split = head
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("found end-of-headers above");
+        let mut tail: Vec<u8> = head[split + 4..].to_vec();
+        while !tail.windows(b"HELLO".len()).any(|w| w == b"HELLO") {
+            let n = client.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&tmp[..n]);
+        }
+        assert!(
+            tail.windows(b"HELLO".len()).any(|w| w == b"HELLO"),
+            "expected upstream banner through tunnel; got: {:?}",
+            String::from_utf8_lossy(&tail)
+        );
+
+        // Tear down so the tunnel completes and stats settle.
+        let _ = client.shutdown().await;
+        // Give the proxy's bridge task a moment to flush stats.
+        for _ in 0..50 {
+            if let Some(snap) = o.proxy().stats() {
+                if snap.total_connections >= 1 && snap.total_bytes_down >= 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let snap = o.proxy().stats().expect("proxy running");
+        assert!(
+            snap.total_connections >= 1,
+            "expected ≥1 connection in stats, got {snap:?}"
+        );
+        assert!(
+            snap.total_bytes_down >= b"HELLO\n".len() as u64,
+            "expected upstream→client bytes counted, got {snap:?}"
+        );
+        let host_key = upstream_addr.ip().to_string();
+        let per_host = snap
+            .per_host
+            .iter()
+            .find(|h| h.host == host_key)
+            .unwrap_or_else(|| panic!("missing per-host stats for {host_key}; got {snap:?}"));
+        assert!(per_host.connections >= 1);
     }
 }

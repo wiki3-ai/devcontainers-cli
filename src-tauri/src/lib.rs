@@ -29,7 +29,14 @@ pub fn run() {
 
     let host_state = host::HostState::load().unwrap_or_default();
     let runtime_registry = devcontainer_core::RuntimeRegistry::with_default_backends();
-    let orchestrator = devcontainer_core::LifecycleOrchestrator::new();
+    // Lazy-started internal caching proxy. Defaults to the Apple
+    // Containers bridge gateway (`192.168.64.1`) so containers can
+    // reach it without us teaching the runtime about extra routes.
+    // Bind failure is cached as "disabled" — containers still launch,
+    // they just don't get an auto-injected `HTTP_PROXY`.
+    let orchestrator = devcontainer_core::LifecycleOrchestrator::with_proxy(
+        devcontainer_core::ProxyManager::with_apple_containers_default(),
+    );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -55,6 +62,7 @@ pub fn run() {
             commands::lifecycle::container_rebuild,
             commands::lifecycle::container_remove,
             commands::lifecycle::container_cancel,
+            commands::proxy::proxy_stats,
             commands::fs::fs_is_file,
             commands::fs::fs_read_file,
             commands::fs::fs_write_file,

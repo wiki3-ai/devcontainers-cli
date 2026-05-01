@@ -566,6 +566,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "devcontainer-proxy",
  "hex",
  "once_cell",
  "parking_lot",
@@ -578,6 +579,17 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "devcontainer-proxy"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

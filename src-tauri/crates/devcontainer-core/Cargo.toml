@@ -11,6 +11,7 @@ rust-version = "1.77"
 name = "devcontainer_core"
 
 [dependencies]
+devcontainer-proxy = { path = "../devcontainer-proxy" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

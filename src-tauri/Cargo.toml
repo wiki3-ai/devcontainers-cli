@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/devcontainer-core"]
+members = [".", "crates/devcontainer-core", "crates/devcontainer-proxy"]
 
 [package]
 name = "devcontainers-app"

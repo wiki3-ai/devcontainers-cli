@@ -28,5 +28,10 @@ pub use container::{
 pub use devcontainer::lifecycle::{
     LifecycleError, LifecycleOrchestrator, LifecycleStatus, LABEL_CONFIG_HASH,
 };
+pub use devcontainer::proxy_manager::ProxyManager;
 pub use devcontainer::translate::{DevContainerBuild, LifecycleCommand, ParsedDevContainer};
 pub use events::EventSink;
+
+// Re-exported so app crates can return proxy stats from Tauri
+// commands without depending on `devcontainer-proxy` directly.
+pub use devcontainer_proxy::{HostStats, ProxyStatsSnapshot};
