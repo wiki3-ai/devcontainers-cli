@@ -180,9 +180,42 @@ impl ContainerRuntime for AppleContainersRuntime {
         // The helper is idempotent and cheap when everything is
         // already in place, so it's fine to run on every cold cache
         // hit (we still gate on `system_ready` above).
-        cli_helpers::ensure_service_running(std::path::Path::new(self.cli.binary()))
-            .await
-            .map_err(ContainerRuntimeError::Backend)?;
+        // Bridge cli_helpers' line-by-line String sink into our
+        // LogChunk sink so the kernel-download progress shows up in
+        // the embedding app's UI rather than disappearing into the
+        // void until exit.
+        let bridge_handle = log_sink.as_ref().map(|chunk_tx| {
+            let (str_tx, mut str_rx) = mpsc::channel::<String>(64);
+            let chunk_tx = chunk_tx.clone();
+            let handle = tokio::spawn(async move {
+                while let Some(line) = str_rx.recv().await {
+                    if chunk_tx
+                        .send(LogChunk {
+                            stream: LogStreamKind::System,
+                            line,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            (str_tx, handle)
+        });
+        let str_sink = bridge_handle.as_ref().map(|(tx, _)| tx.clone());
+        let result = cli_helpers::ensure_service_running_with_log(
+            std::path::Path::new(self.cli.binary()),
+            str_sink,
+        )
+        .await;
+        // Drop the original sender so the bridge task exits once
+        // cli_helpers' internal pumps drain.
+        if let Some((tx, handle)) = bridge_handle {
+            drop(tx);
+            let _ = handle.await;
+        }
+        result.map_err(ContainerRuntimeError::Backend)?;
         if !already_running {
             if let Some(sink) = &log_sink {
                 let _ = sink

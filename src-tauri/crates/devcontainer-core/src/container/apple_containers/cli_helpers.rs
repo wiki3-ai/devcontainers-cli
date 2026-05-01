@@ -85,31 +85,108 @@ pub fn detect() -> AppleContainerStatus {
 /// (sometimes several seconds) can take a while, so we impose a
 /// generous timeout.
 pub async fn ensure_service_running(container_bin: &Path) -> Result<(), String> {
+    ensure_service_running_with_log(container_bin, None).await
+}
+
+/// Variant of [`ensure_service_running`] that streams stdout/stderr
+/// from the underlying `container` invocations line-by-line into the
+/// supplied sink. Useful for surfacing the kernel-download progress
+/// (which can take a couple of minutes on first run) in the embedding
+/// app's UI rather than leaving the user staring at a spinner.
+///
+/// The sender is fed bare lines (no stream tag) — the caller is
+/// responsible for tagging them as `system` / `stdout` / `stderr` if
+/// it needs that distinction.
+pub async fn ensure_service_running_with_log(
+    container_bin: &Path,
+    log_sink: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
+
+    if let Some(sink) = &log_sink {
+        let _ = sink
+            .send(format!(
+                "$ {} system start --enable-kernel-install",
+                container_bin.display()
+            ))
+            .await;
+    }
 
     let mut cmd = Command::new(container_bin);
     cmd.arg("system")
         .arg("start")
         .arg("--enable-kernel-install");
 
-    let child = cmd
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn `container system start`: {e}"))?;
 
-    let output = tokio::time::timeout(Duration::from_secs(600), child.wait_with_output())
+    // Stream stdout/stderr line-by-line into the sink while also
+    // accumulating them into buffers so we can include them in the
+    // error message on failure. This is what surfaces the kernel
+    // download progress to the UI.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout pipe missing".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr pipe missing".to_string())?;
+    let stdout_buf = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+    let stderr_buf = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+    let stdout_task = {
+        let buf = stdout_buf.clone();
+        let sink = log_sink.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                {
+                    let mut b = buf.lock();
+                    b.push_str(&line);
+                    b.push('\n');
+                }
+                if let Some(sink) = &sink {
+                    let _ = sink.send(line).await;
+                }
+            }
+        })
+    };
+    let stderr_task = {
+        let buf = stderr_buf.clone();
+        let sink = log_sink.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                {
+                    let mut b = buf.lock();
+                    b.push_str(&line);
+                    b.push('\n');
+                }
+                if let Some(sink) = &sink {
+                    let _ = sink.send(line).await;
+                }
+            }
+        })
+    };
+
+    let status = tokio::time::timeout(Duration::from_secs(600), child.wait())
         .await
         .map_err(|_| "`container system start` timed out after 10 minutes".to_string())?
         .map_err(|e| format!("wait for `container system start`: {e}"))?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
 
-    if !output.status.success() {
+    if !status.success() {
         return Err(format!(
             "`container system start` failed (exit {:?}):\n--- stderr ---\n{}\n--- stdout ---\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout),
+            status.code(),
+            stderr_buf.lock(),
+            stdout_buf.lock(),
         ));
     }
 
@@ -122,7 +199,18 @@ pub async fn ensure_service_running(container_bin: &Path) -> Result<(), String> 
     // state and run `container system kernel set --recommended` to
     // self-heal without bouncing out to the command line.
     if !default_kernel_installed() {
-        ensure_default_kernel(container_bin).await?;
+        if let Some(sink) = &log_sink {
+            let _ = sink
+                .send(
+                    "default kernel not installed; downloading recommended kernel (this can take a couple of minutes on first run)…"
+                        .to_string(),
+                )
+                .await;
+        }
+        ensure_default_kernel(container_bin, log_sink.as_ref()).await?;
+        if let Some(sink) = &log_sink {
+            let _ = sink.send("default kernel installed".to_string()).await;
+        }
     }
     Ok(())
 }
@@ -152,28 +240,93 @@ fn default_kernel_installed() -> bool {
 /// Container's recommended default kernel non-interactively. Used to
 /// recover from a half-initialised state where the service is up but
 /// no default kernel is configured.
-async fn ensure_default_kernel(container_bin: &Path) -> Result<(), String> {
+async fn ensure_default_kernel(
+    container_bin: &Path,
+    log_sink: Option<&tokio::sync::mpsc::Sender<String>>,
+) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
 
-    let fut = Command::new(container_bin)
+    if let Some(sink) = log_sink {
+        let _ = sink
+            .send(format!(
+                "$ {} system kernel set --recommended",
+                container_bin.display()
+            ))
+            .await;
+    }
+
+    let mut child = Command::new(container_bin)
         .arg("system")
         .arg("kernel")
         .arg("set")
         .arg("--recommended")
         .stdin(std::process::Stdio::null())
-        .output();
-    let out = tokio::time::timeout(Duration::from_secs(600), fut)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn `container system kernel set`: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout pipe missing".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr pipe missing".to_string())?;
+    let stdout_buf = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+    let stderr_buf = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+    let stdout_task = {
+        let buf = stdout_buf.clone();
+        let sink = log_sink.cloned();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                {
+                    let mut b = buf.lock();
+                    b.push_str(&line);
+                    b.push('\n');
+                }
+                if let Some(sink) = &sink {
+                    let _ = sink.send(line).await;
+                }
+            }
+        })
+    };
+    let stderr_task = {
+        let buf = stderr_buf.clone();
+        let sink = log_sink.cloned();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                {
+                    let mut b = buf.lock();
+                    b.push_str(&line);
+                    b.push('\n');
+                }
+                if let Some(sink) = &sink {
+                    let _ = sink.send(line).await;
+                }
+            }
+        })
+    };
+
+    let status = tokio::time::timeout(Duration::from_secs(600), child.wait())
         .await
         .map_err(|_| {
             "`container system kernel set --recommended` timed out after 10 minutes".to_string()
         })?
-        .map_err(|e| format!("spawn `container system kernel set`: {e}"))?;
-    if !out.status.success() {
+        .map_err(|e| format!("wait for `container system kernel set`: {e}"))?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    if !status.success() {
         return Err(format!(
             "`container system kernel set --recommended` failed (exit {:?}):\n--- stderr ---\n{}\n--- stdout ---\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr),
-            String::from_utf8_lossy(&out.stdout),
+            status.code(),
+            stderr_buf.lock(),
+            stdout_buf.lock(),
         ));
     }
     Ok(())
