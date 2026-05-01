@@ -67,9 +67,26 @@ impl Default for AppleContainersRuntime {
 }
 
 impl AppleContainersRuntime {
+    /// Build a runtime configured with the canonical `container`
+    /// binary. We probe the standard install locations first
+    /// (`/usr/local/bin/container` per Apple's installer, then
+    /// `/opt/homebrew/bin/container`), falling back to bare
+    /// `"container"` for `PATH` lookup.
+    ///
+    /// The probe matters for GUI apps launched from Finder/Launchpad:
+    /// launchd-spawned processes inherit a minimal `PATH`
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`) that does **not** include
+    /// `/usr/local/bin`, so `Command::new("container")` would fail
+    /// with `No such file or directory` even though `container --version`
+    /// works fine in a developer shell. Resolving to an absolute path
+    /// here sidesteps that.
     pub fn new() -> Self {
+        let binary = cli_helpers::detect()
+            .path
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_else(|| "container".to_string());
         Self {
-            cli: ContainerCli::default(),
+            cli: ContainerCli::new(binary),
             system_ready: AtomicBool::new(false),
         }
     }
