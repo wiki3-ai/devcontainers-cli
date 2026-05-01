@@ -189,9 +189,8 @@ async fn handle_client(mut client: TcpStream, stats: &Arc<ProxyStats>) -> Result
             }
         };
 
-    let (method, target) = parse_request_line(&request).map_err(|e| {
+    let (method, target) = parse_request_line(&request).inspect_err(|_e| {
         stats.record_bad_request();
-        e
     })?;
 
     if !method.eq_ignore_ascii_case("CONNECT") {
@@ -202,9 +201,8 @@ async fn handle_client(mut client: TcpStream, stats: &Arc<ProxyStats>) -> Result
         return Err(ClientError::Unsupported(method.to_string()));
     }
 
-    let (host, port) = split_host_port(target).map_err(|e| {
+    let (host, port) = split_host_port(target).inspect_err(|_e| {
         stats.record_bad_request();
-        e
     })?;
 
     stats.record_connect(host);

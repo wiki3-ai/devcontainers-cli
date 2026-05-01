@@ -739,6 +739,7 @@ impl LifecycleOrchestrator {
     /// Decide whether to pull a pre-built image or build one from a
     /// Dockerfile, returning the resulting [`ImageRef`]. Build output
     /// is streamed to `sink` line-by-line.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_image(
         &self,
         sink: &dyn EventSink,
@@ -1459,6 +1460,7 @@ async fn write_postcreate_sentinel(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_hook(
     orchestrator: &LifecycleOrchestrator,
     sink: Arc<dyn EventSink>,
