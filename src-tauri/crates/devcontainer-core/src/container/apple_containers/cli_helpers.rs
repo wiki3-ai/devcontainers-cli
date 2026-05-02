@@ -409,6 +409,47 @@ pub async fn list_running_container_names(container_bin: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Look up the IPv4 address of a running container, by name. Returns
+/// `None` if the container is not found, has no network, or `container
+/// inspect` fails.
+///
+/// This is useful when the host's loopback publish-proxy is unhealthy
+/// (e.g. corp-laptop network filters that RST `127.0.0.1:<hostPort>`):
+/// the embedding app can race a probe against the direct vmnet
+/// address as a fallback. The returned string is the bare IPv4
+/// (`192.168.64.4`), with any CIDR suffix stripped.
+pub async fn inspect_container_ipv4(container_bin: &Path, name: &str) -> Option<String> {
+    use tokio::process::Command;
+
+    let fut = Command::new(container_bin)
+        .arg("inspect")
+        .arg(name)
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(5), fut).await {
+        Ok(Ok(o)) if o.status.success() => o,
+        _ => return None,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    // `container inspect <name>` returns an array with a single
+    // object. Pick that object out, then walk `networks[0]
+    // .ipv4Address`.
+    let obj = match v {
+        serde_json::Value::Array(a) => a.into_iter().next()?,
+        v @ serde_json::Value::Object(_) => v,
+        _ => return None,
+    };
+    let networks = obj.get("networks")?.as_array()?;
+    let first = networks.first()?;
+    let raw = first.get("ipv4Address")?.as_str()?;
+    // Strip CIDR suffix if present (`192.168.64.4/24` -> `192.168.64.4`).
+    let bare = raw.split('/').next()?.trim();
+    if bare.is_empty() {
+        return None;
+    }
+    Some(bare.to_string())
+}
+
 /// Stop a specific container by name. Returns `Ok(())` even if the
 /// container is already gone (treats "not found" as success).
 pub async fn stop_container_by_name(container_bin: &Path, name: &str) -> Result<(), String> {

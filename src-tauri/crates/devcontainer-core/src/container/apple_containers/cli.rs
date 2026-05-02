@@ -129,6 +129,12 @@ pub(crate) fn build_args_with_dns(spec: &BuildSpec, dns: &[String]) -> Vec<Strin
 /// duplicates are removed. We cap at 3 to mirror the typical
 /// `/etc/resolv.conf` limit; passing a hundred resolvers serves no
 /// purpose.
+///
+/// IPv6 resolver entries are skipped: Apple Container's build sandbox
+/// has been observed to fail bootstrap (`configureDns`) when handed
+/// IPv6 nameservers, particularly link-local / ULA addresses that
+/// Tahoe's auto-config emits via `scutil --dns`. IPv4 alone is
+/// sufficient for the upstream-cache reasoning above.
 fn host_dns_servers() -> Vec<String> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
@@ -150,7 +156,7 @@ fn host_dns_servers() -> Vec<String> {
             continue;
         };
         let ip = ip.trim();
-        if ip.is_empty() || !looks_like_ip(ip) {
+        if ip.is_empty() || !is_ipv4(ip) {
             continue;
         }
         if seen.insert(ip.to_string()) {
@@ -163,11 +169,10 @@ fn host_dns_servers() -> Vec<String> {
     servers
 }
 
-/// Cheap sanity check: accept anything that parses as an IPv4 or IPv6
-/// address. We're not validating reachability — the runtime will
-/// surface its own error if the address is unusable.
-fn looks_like_ip(s: &str) -> bool {
-    s.parse::<std::net::IpAddr>().is_ok()
+/// Accept only IPv4 literals. IPv6 entries are intentionally rejected
+/// — see [`host_dns_servers`] for the rationale.
+fn is_ipv4(s: &str) -> bool {
+    s.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
 pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<String> {
