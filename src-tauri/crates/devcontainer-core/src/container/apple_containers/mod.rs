@@ -34,9 +34,9 @@ mod tests;
 
 pub use cli::ContainerCli;
 pub use cli_helpers::{
-    detect, ensure_service_running, inspect_container_ipv4, is_service_running,
-    list_running_container_names, probe_with_dirs, stop_container_by_name, stop_service,
-    AppleContainerStatus,
+    detect, ensure_service_running, find_container_by_mount_source, inspect_container_ipv4,
+    is_service_running, list_running_container_names, probe_with_dirs, stop_container_by_name,
+    stop_service, AppleContainerStatus,
 };
 
 /// Apple Containers backend. The binary name (`container` by default) is

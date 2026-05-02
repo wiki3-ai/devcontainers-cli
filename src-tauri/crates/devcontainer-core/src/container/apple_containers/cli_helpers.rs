@@ -450,8 +450,88 @@ pub async fn inspect_container_ipv4(container_bin: &Path, name: &str) -> Option<
     Some(bare.to_string())
 }
 
-/// Stop a specific container by name. Returns `Ok(())` even if the
-/// container is already gone (treats "not found" as success).
+/// Find a running container whose mount-source matches `local_path`,
+/// returning `(name, ipv4)` if any.
+///
+/// Apple Container's `container ls --format json` returns the full
+/// per-container configuration including `mounts[].source` and
+/// `networks[].ipv4Address`. Embedding apps that lose track of
+/// their containers across restarts (e.g. Wiki3 keeps its
+/// in-memory `LocalSiteManager` only for the running session) use
+/// this to recover the container's identity from the workspace
+/// path the user opened. The IPv4 address is returned alongside
+/// the name so callers don't have to do a second `inspect` call —
+/// `container ls` already has it.
+///
+/// The match is on the canonicalised path; symlink-equivalent
+/// representations of the same workspace will match.
+pub async fn find_container_by_mount_source(
+    container_bin: &Path,
+    local_path: &Path,
+) -> Option<(String, String)> {
+    use tokio::process::Command;
+
+    let target = std::fs::canonicalize(local_path).unwrap_or_else(|_| local_path.to_path_buf());
+
+    let fut = Command::new(container_bin)
+        .arg("ls")
+        .arg("--format")
+        .arg("json")
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(5), fut).await {
+        Ok(Ok(o)) if o.status.success() => o,
+        _ => return None,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    let arr = v.as_array()?;
+
+    for obj in arr {
+        let cfg = obj.get("configuration").unwrap_or(obj);
+        let mounts = match cfg.get("mounts").and_then(|m| m.as_array()) {
+            Some(m) => m,
+            None => continue,
+        };
+        let matches = mounts.iter().any(|m| {
+            m.get("source")
+                .and_then(|s| s.as_str())
+                .map(|s| {
+                    let p = std::path::PathBuf::from(s);
+                    let canon = std::fs::canonicalize(&p).unwrap_or(p);
+                    canon == target
+                })
+                .unwrap_or(false)
+        });
+        if !matches {
+            continue;
+        }
+        let name = obj
+            .get("name")
+            .or_else(|| obj.get("Name"))
+            .or_else(|| cfg.get("id"))
+            .or_else(|| obj.get("id"))
+            .or_else(|| obj.get("ID"))
+            .and_then(|n| n.as_str())?
+            .to_string();
+        // `networks[]` lives at the top of the inspect object, but
+        // also commonly under `configuration.networks` — try both.
+        let networks = obj
+            .get("networks")
+            .or_else(|| cfg.get("networks"))
+            .and_then(|n| n.as_array());
+        let ipv4 = networks
+            .and_then(|nets| nets.first())
+            .and_then(|n| n.get("ipv4Address"))
+            .and_then(|v| v.as_str())
+            .and_then(|raw| raw.split('/').next())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(ipv4) = ipv4 else { continue };
+        return Some((name, ipv4));
+    }
+    None
+}
+
 pub async fn stop_container_by_name(container_bin: &Path, name: &str) -> Result<(), String> {
     use tokio::process::Command;
 
