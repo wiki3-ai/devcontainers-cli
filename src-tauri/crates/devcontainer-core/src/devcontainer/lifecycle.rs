@@ -971,6 +971,16 @@ impl LifecycleOrchestrator {
         for (k, v) in &proxy_env {
             spec.env.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        // Apple's `container` CLI does not auto-register
+        // `host.docker.internal` (unlike Docker Desktop), so expose
+        // the bridge gateway IP as `HOST_GATEWAY_IP` for code that
+        // wants a name-free path to host services. The matching
+        // `/etc/hosts` entry is written via an exec right after
+        // `runtime.start` below — we own the ordering, so it lands
+        // before any lifecycle hook runs. User-supplied env wins.
+        spec.env
+            .entry("HOST_GATEWAY_IP".to_string())
+            .or_insert_with(|| HOST_BRIDGE_GATEWAY_IP.to_string());
         if let Some(h) = config_hash.as_deref() {
             spec.labels
                 .insert(LABEL_CONFIG_HASH.to_string(), h.to_string());
@@ -1056,6 +1066,25 @@ impl LifecycleOrchestrator {
             Some(&spec.image.repository),
             None,
         );
+
+        // Best-effort: register `host.docker.internal` -> the bridge
+        // gateway by appending to `/etc/hosts`. Apple's `container`
+        // CLI does not auto-register the name (unlike Docker
+        // Desktop), so without this, host services bound on the
+        // bridge IP are reachable only by literal IP or via the
+        // matching `HOST_GATEWAY_IP` env var. We exec this *before*
+        // any lifecycle hook so any subsequent user code sees the
+        // mapping. Any failure (read-only `/etc`, distroless image,
+        // unwritable hosts file) is logged and ignored — the env
+        // var path still works.
+        if let Err(err) = inject_host_gateway_hosts_entry(runtime.as_ref(), &container_id).await {
+            debug!(
+                workspace = workspace_id,
+                container = %container_id,
+                error = %err,
+                "host.docker.internal: /etc/hosts write skipped"
+            );
+        }
 
         // Lifecycle hooks. `initializeCommand` runs on the host (intentionally
         // not implemented in the MVP — host-side execution is gated on the
@@ -1428,6 +1457,41 @@ async fn postcreate_sentinel_exists(
         Ok(r) => Ok(r.exit_code == 0),
         Err(_) => Ok(false),
     }
+}
+
+/// Append a `host.docker.internal` entry to the container's
+/// `/etc/hosts` so user code can reach host services by the
+/// well-known hostname. Apple's `container` CLI does not auto-
+/// register this name (Docker Desktop does); writing the file is
+/// the simplest per-container, no-admin-prompt fix. Best-effort:
+/// the caller logs and moves on if `/etc` is read-only or `sh` is
+/// missing — `HOST_GATEWAY_IP` env var stays available as a
+/// fallback. Idempotent: the `grep -q` guard avoids duplicate
+/// lines when a container is started multiple times.
+async fn inject_host_gateway_hosts_entry(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+) -> Result<(), ContainerRuntimeError> {
+    let script = format!(
+        "grep -q '\\bhost\\.docker\\.internal\\b' /etc/hosts 2>/dev/null \
+         || printf '%s\\thost.docker.internal\\n' '{HOST_BRIDGE_GATEWAY_IP}' >> /etc/hosts"
+    );
+    let opts = ExecOptions {
+        command: vec!["sh".to_string(), "-c".to_string(), script],
+        workdir: None,
+        env: std::collections::HashMap::new(),
+        user: None,
+        tty: false,
+        ..Default::default()
+    };
+    let result = runtime.exec(container_id, &opts).await?;
+    if result.exit_code != 0 {
+        return Err(ContainerRuntimeError::Backend(format!(
+            "failed to write /etc/hosts (exit {})",
+            result.exit_code
+        )));
+    }
+    Ok(())
 }
 
 /// Write `POSTCREATE_SENTINEL` after create-time hooks succeed. We
