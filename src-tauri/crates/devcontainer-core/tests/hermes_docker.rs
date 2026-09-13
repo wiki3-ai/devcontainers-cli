@@ -16,6 +16,11 @@
 //! aliases, `containerEnv`, forwarded ports and a `postCreateCommand`.
 //! Nothing here is special-cased for Hermes in the implementation under
 //! test — the project is the fixture, not the subject.
+//!
+//! Both tests publish the project's fixed host ports (8642, 9119), so they
+//! are serialised against each other, and they remove their container on the
+//! way out unless `WIKI3_KEEP_CONTAINER=1` is set. A leftover container
+//! holding those ports is exactly what breaks the next app launch.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -76,6 +81,29 @@ fn docker_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Serialise the tests in this file.
+///
+/// Both drive the same project, which publishes fixed host ports (8642 and
+/// 9119). `cargo test` runs tests on threads by default, so without this the
+/// second test fails to bind a port the first one already holds — a
+/// confusing failure that has nothing to do with the code under test.
+async fn serialise() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// Whether to leave the container running after a test.
+///
+/// Off by default: a test that leaves a container publishing 8642/9119 will
+/// break the next thing that tries to use those ports — including the app
+/// itself. Set `WIKI3_KEEP_CONTAINER=1` when you want to poke at the
+/// dashboard afterwards.
+fn keep_container() -> bool {
+    std::env::var("WIKI3_KEEP_CONTAINER").ok().as_deref() == Some("1")
 }
 
 /// Run `docker …` and return `(success, stdout)`.
@@ -149,6 +177,7 @@ fn assert_prerequisites(repo: &Path) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Docker, the hermes-devcontainer checkout, and a 3.9GB base image"]
 async fn hermes_devcontainer_runs_on_docker() {
+    let _guard = serialise().await;
     let Some(repo) = hermes_repo() else {
         eprintln!("SKIP: hermes-devcontainer not found (set WIKI3_HERMES_DEVCONTAINER)");
         return;
@@ -276,13 +305,28 @@ async fn hermes_devcontainer_runs_on_docker() {
         println!("(skipping Unsloth reachability check; set WIKI3_CHECK_UNSLOTH=1 to enable)");
     }
 
-    println!("\nPASS. Container {cid} left running for inspection.");
-    println!("  docker stop {cid} && docker rm {cid}");
+    println!("\nPASS. Container {cid} satisfied every assertion.");
+    if keep_container() {
+        println!("WIKI3_KEEP_CONTAINER=1 — leaving it running; clean up with:");
+        println!("  docker rm -f {cid}");
+    } else {
+        // Leave the machine as we found it. A stray container holding
+        // 8642/9119 will break the next thing that wants those ports.
+        if let Err(e) = orchestrator
+            .remove_with_sink(sink.as_ref(), &registry, "hermes")
+            .await
+        {
+            println!("WARNING: could not clean up container {cid}: {e}");
+        } else {
+            println!("removed container {cid} (set WIKI3_KEEP_CONTAINER=1 to keep it)");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Docker and the hermes-devcontainer checkout"]
 async fn hermes_data_volume_survives_recreation() {
+    let _guard = serialise().await;
     let Some(repo) = hermes_repo() else {
         eprintln!("SKIP: hermes-devcontainer not found");
         return;
@@ -335,5 +379,19 @@ async fn hermes_data_volume_survives_recreation() {
     assert!(ok, "the marker should survive recreation: {out}");
     assert!(out.contains("persisted"), "marker contents: {out}");
 
+    // Tidy up: drop the marker so it does not linger in the durable volume,
+    // then the container, so a later run starts from a clean slate.
+    let _ = docker(&["exec", &cid2, "rm", "-f", marker]);
     println!("\nPASS. /opt/data survived container recreation ({cid} -> {cid2}).");
+    if keep_container() {
+        println!("WIKI3_KEEP_CONTAINER=1 — leaving container {cid2} running");
+        println!("  docker rm -f {cid2}");
+    } else if let Err(e) = orchestrator
+        .remove_with_sink(sink.as_ref(), &registry, "hermes")
+        .await
+    {
+        println!("WARNING: could not clean up container {cid2}: {e}");
+    } else {
+        println!("removed container {cid2}");
+    }
 }

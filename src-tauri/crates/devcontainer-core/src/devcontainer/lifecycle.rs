@@ -727,6 +727,20 @@ impl LifecycleOrchestrator {
         }
     }
 
+    /// Drop the recorded container id for `workspace_id`.
+    ///
+    /// [`Self::record_state`] deliberately *keeps* an existing id when
+    /// passed `None` — that is right for preserving the repo↔container
+    /// linkage while a hook fails after the container exists. It is wrong
+    /// when we have just deleted the container, so that case needs an
+    /// explicit forget rather than a `None`.
+    fn forget_container(&self, workspace_id: &str) {
+        let mut map = self.slots.write();
+        if let Some(slot) = map.get_mut(workspace_id) {
+            slot.container_id = None;
+        }
+    }
+
     fn record_error(&self, workspace_id: &str, message: &str) {
         let mut map = self.slots.write();
         let slot = map.entry(workspace_id.to_string()).or_default();
@@ -1096,7 +1110,58 @@ impl LifecycleOrchestrator {
             &format!("starting container {container_id}"),
         );
         debug!(workspace = workspace_id, "stage=start begin");
-        stage("start", runtime.start(&container_id).await)?;
+        if let Err(err) = runtime.start(&container_id).await {
+            // `start` can fail for reasons that have nothing to do with the
+            // container being wrong — most commonly a host port already
+            // being held by something else ("Bind for 0.0.0.0:8642 failed:
+            // port is already allocated").
+            //
+            // When that happens we must not leave the container we just
+            // created sitting in `Created`: the next `up` would adopt it by
+            // name, fail in exactly the same way, and the user would be
+            // stuck with a container they cannot start and cannot easily
+            // clear. Clean up after ourselves instead.
+            //
+            // Only what *this* call created is removed — an adopted
+            // container may be one the user is deliberately keeping.
+            if freshly_created {
+                match runtime.remove(&container_id, true).await {
+                    Ok(()) => {
+                        // Forget the id *before* recording state: a bare
+                        // `record_state("absent", None, ..)` would leave the
+                        // deleted container's id in the slot, and the error
+                        // status we report below would then point at a
+                        // container that no longer exists.
+                        self.forget_container(workspace_id);
+                        self.record_state(workspace_id, "absent", None, None);
+                        sink.log(
+                            workspace_id,
+                            LogStreamKind::System,
+                            &format!(
+                                "start failed; removed container {container_id} so the next \
+                                 attempt creates a fresh one"
+                            ),
+                        );
+                    }
+                    Err(cleanup_err) => {
+                        warn!(
+                            workspace = workspace_id,
+                            container = %container_id,
+                            "cleanup after a failed start also failed: {cleanup_err}"
+                        );
+                        sink.log(
+                            workspace_id,
+                            LogStreamKind::System,
+                            &format!(
+                                "start failed and cleanup of {container_id} also failed: \
+                                 {cleanup_err}"
+                            ),
+                        );
+                    }
+                }
+            }
+            return Err(stage::<()>("start", Err(err)).unwrap_err());
+        }
         debug!(workspace = workspace_id, "stage=start end");
         self.record_state(workspace_id, "running", Some(&container_id), None);
         sink.status(
@@ -2458,6 +2523,63 @@ mod tests {
         assert!(
             !states.iter().any(|s| s == "building" || s == "creating"),
             "no build/create should be attempted; states: {states:?}"
+        );
+    }
+
+    // -------- a failed start must not leave an orphan container --------
+
+    /// If `start` fails after we created the container, clean it up.
+    ///
+    /// This is the host-port-conflict case: the container is created fine,
+    /// then cannot start because something else already holds the port.
+    /// Leaving it in `Created` makes every subsequent `up` adopt it and
+    /// fail identically, so the user is stuck with a container they can
+    /// neither start nor easily clear.
+    #[tokio::test]
+    async fn up_removes_the_container_it_created_when_start_fails() {
+        let o = LifecycleOrchestrator::new();
+        o.set_parsed_config("ws", parsed_with_image("ubuntu:24.04"));
+
+        let mut script = FakeScript::default();
+        script.start_err = Some(
+            "failed to set up container networking: Bind for 0.0.0.0:8642 failed: \
+             port is already allocated"
+                .into(),
+        );
+        let registry = registry_with(FakeRuntime::new(script));
+        let sink = Arc::new(CapturingSink::default());
+
+        let err = o
+            .up_with_sink(sink.clone(), &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .await
+            .expect_err("start must fail");
+        assert!(
+            err.to_string().contains("port is already allocated"),
+            "the underlying reason must survive: {err}"
+        );
+
+        // The cleanup line is only logged once the removal has actually
+        // succeeded, so its presence is evidence the container is gone.
+        let lines: Vec<String> = sink.logs.lock().iter().map(|l| l.line.clone()).collect();
+        assert!(
+            lines.iter().any(|l| l.contains("removed container")),
+            "the container created by this call should have been removed; logs: {lines:?}"
+        );
+
+        // The slot must not keep pointing at a container that no longer
+        // exists, or a later stop/remove would act on a dead id. The state
+        // itself is `error` by the time `up_with_sink` has reported the
+        // failure — that part is correct, the *container* is what must be
+        // forgotten.
+        let snap = o.snapshot("ws");
+        assert_eq!(
+            snap.state, "error",
+            "the failed up should be reported as an error"
+        );
+        assert!(
+            snap.container_id.is_none(),
+            "the deleted container's id must not be retained; got {:?}",
+            snap.container_id
         );
     }
 
