@@ -13,10 +13,12 @@ use super::cli::{
     image_ref_to_string, logs_args, parse_inspect, parse_list, pull_args, remove_args,
     system_status_is_running,
 };
+use super::AppleContainersRuntime;
 use crate::container::traits::{
-    BuildSpec, ContainerSpec, ContainerState, ExecOptions, ImageRef, LogOptions, MountKind,
-    MountSpec, PortForward, PortProtocol,
+    BuildSpec, CompatibilitySeverity, ContainerRuntime, ContainerSpec, ContainerState, ExecOptions,
+    ImageRef, LogOptions, MountKind, MountSpec, PortForward, PortProtocol,
 };
+use crate::devcontainer::translate::ParsedDevContainer;
 
 fn ubuntu() -> ImageRef {
     ImageRef {
@@ -441,4 +443,74 @@ fn create_args_emits_label_flag_before_run_args() {
     let runarg = args.iter().position(|a| a == "--cpus=2").unwrap();
     assert_eq!(args[label_val], "org.devcontainers.config_hash=deadbeef");
     assert!(label_val < runarg, "labels precede run_args: {args:?}");
+}
+
+// ---------------------------------------------------------------------
+// Preflight compatibility.
+//
+// Apple's `container` CLI is not a Docker drop-in: the Hermes project's
+// `runArgs` contain `--add-host=...`, which the CLI rejects at create
+// time with `Error: Unknown option '--add-host'`. These tests pin the
+// promise that this is detected *before* anything is created, and that
+// flags we have no evidence against are not rejected speculatively.
+// ---------------------------------------------------------------------
+
+fn parsed_with_run_args(run_args: Vec<String>) -> ParsedDevContainer {
+    ParsedDevContainer {
+        image: Some("ubuntu:24.04".into()),
+        run_args,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn validate_devcontainer_blocks_add_host() {
+    let rt = AppleContainersRuntime::with_binary("container");
+    let parsed = parsed_with_run_args(vec![
+        "--add-host=host.docker.internal:host-gateway".into(),
+        "--add-host=host.containers.internal:host-gateway".into(),
+    ]);
+    let report = rt.validate_devcontainer(&parsed);
+    assert!(!report.is_supported(), "report: {}", report.summary());
+
+    let blocking: Vec<_> = report.blocking().collect();
+    assert_eq!(blocking.len(), 2, "one issue per offending arg");
+    assert_eq!(blocking[0].severity, CompatibilitySeverity::Unsupported);
+    assert_eq!(blocking[0].field, "runArgs");
+    assert_eq!(
+        blocking[0].value.as_deref(),
+        Some("--add-host=host.docker.internal:host-gateway")
+    );
+
+    // The summary has to name the field and the offending value so the
+    // user can find the line of devcontainer.json to change, and say
+    // what to do instead.
+    let summary = report.summary();
+    assert!(summary.contains("runArgs"), "summary: {summary}");
+    assert!(summary.contains("--add-host"), "summary: {summary}");
+    assert!(summary.contains("HOST_GATEWAY_IP"), "summary: {summary}");
+}
+
+#[test]
+fn validate_devcontainer_blocks_the_space_separated_spelling_too() {
+    let rt = AppleContainersRuntime::with_binary("container");
+    let report = rt.validate_devcontainer(&parsed_with_run_args(vec![
+        "--add-host host.docker.internal:host-gateway".into(),
+    ]));
+    assert!(!report.is_supported(), "report: {}", report.summary());
+}
+
+#[test]
+fn validate_devcontainer_accepts_flags_apple_does_support() {
+    let rt = AppleContainersRuntime::with_binary("container");
+    // This is a deny-list, not an allow-list: an unrecognised flag is
+    // *not* rejected here. Guessing would block configurations that
+    // actually work, which is worse than letting the CLI report its own
+    // error, so entries are added only from observed failures.
+    let report = rt.validate_devcontainer(&parsed_with_run_args(vec![
+        "--cpus=4".into(),
+        "--memory=8g".into(),
+    ]));
+    assert!(report.is_supported(), "report: {}", report.summary());
+    assert!(report.issues.is_empty());
 }

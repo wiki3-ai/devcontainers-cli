@@ -22,10 +22,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    BuildSpec, ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState,
-    ContainerStatus, ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream,
-    LogStreamKind, MountKind, RuntimeAvailability, RuntimeId,
+    BuildSpec, CompatibilityIssue, CompatibilityReport, ContainerRuntime, ContainerRuntimeError,
+    ContainerSpec, ContainerState, ContainerStatus, ExecOptions, ExecResult, ImageRef, LogChunk,
+    LogOptions, LogStream, LogStreamKind, MountKind, RuntimeAvailability, RuntimeId,
 };
+use crate::devcontainer::translate::ParsedDevContainer;
 
 mod cli;
 pub mod cli_helpers;
@@ -38,6 +39,22 @@ pub use cli_helpers::{
     is_service_running, list_running_container_names, probe_with_dirs, stop_container_by_name,
     stop_service, AppleContainerStatus,
 };
+
+/// `runArgs` flags that Apple's `container` CLI does not implement, with
+/// the guidance shown to the user when one is requested.
+///
+/// Deliberately evidence-based: an entry belongs here only once the CLI
+/// has been observed to reject it (or it is confirmed to have no Apple
+/// equivalent). A speculative entry would block a configuration that
+/// actually works, which is worse than letting the CLI report its own
+/// error — so this list should grow from observed failures, not guesses.
+const UNSUPPORTED_RUN_ARGS: &[(&str, &str)] = &[(
+    "--add-host",
+    "Apple Containers cannot add /etc/hosts entries. The host bridge gateway is \
+     already exported as HOST_GATEWAY_IP and written into the container's \
+     /etc/hosts, so reach host services through that instead of \
+     host.docker.internal.",
+)];
 
 /// Apple Containers backend. The binary name (`container` by default) is
 /// configurable via [`AppleContainersRuntime::with_binary`] so the live
@@ -104,6 +121,31 @@ impl AppleContainersRuntime {
 impl ContainerRuntime for AppleContainersRuntime {
     fn id(&self) -> RuntimeId {
         RuntimeId::AppleContainers
+    }
+
+    /// Apple's `container` CLI is *not* a Docker drop-in: it rejects
+    /// options it does not know with `Unknown option '--x'`, and some
+    /// Docker flags have no Apple equivalent at all. Rather than pass
+    /// `runArgs` through and let `container create` fail — or, worse,
+    /// silently ignore something — we check them here so the user gets a
+    /// compatibility message naming the offending entry.
+    fn validate_devcontainer(&self, parsed: &ParsedDevContainer) -> CompatibilityReport {
+        let mut report = CompatibilityReport::supported();
+        for raw in &parsed.run_args {
+            // `docker run` accepts both `--flag=value` and `--flag value`,
+            // so match on the bare flag name to catch either spelling.
+            let flag = raw.split(['=', ' ']).next().unwrap_or(raw.as_str()).trim();
+            for (unsupported, guidance) in UNSUPPORTED_RUN_ARGS {
+                if flag == *unsupported {
+                    report.push(CompatibilityIssue::unsupported(
+                        "runArgs",
+                        Some(raw.clone()),
+                        *guidance,
+                    ));
+                }
+            }
+        }
+        report
     }
 
     async fn probe(&self) -> Result<RuntimeAvailability, ContainerRuntimeError> {

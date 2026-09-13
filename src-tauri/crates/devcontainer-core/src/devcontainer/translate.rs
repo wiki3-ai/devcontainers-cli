@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::container::{ContainerSpec, ImageRef};
+use crate::container::{ContainerSpec, ImageRef, MountKind, MountSpec};
 
 /// `devcontainer.json` lifecycle command: either a single string parsed by
 /// the shell or an explicit argv array. Mirrors the upstream schema.
@@ -90,6 +90,27 @@ pub struct ParsedDevContainer {
     pub workspace_folder: Option<PathBuf>,
     #[serde(default)]
     pub workspace_mount: Option<String>,
+    /// devcontainer.json `overrideCommand`.
+    ///
+    /// Per the spec this defaults to `true`, which means the
+    /// implementation replaces the image's inherited `ENTRYPOINT` /
+    /// `CMD` with a long-running no-op so the container stays alive for
+    /// `exec`-driven workflows. When a project explicitly sets
+    /// `overrideCommand: false` the image's own `CMD` must be preserved
+    /// — e.g. a project whose Dockerfile ends with
+    /// `CMD ["gateway", "run"]`.
+    ///
+    /// `None` means "not specified" and is treated as `true`.
+    #[serde(default)]
+    pub override_command: Option<bool>,
+    /// Raw `devcontainer.json` `mounts` entries, in declaration order.
+    ///
+    /// Both syntaxes the upstream implementations accept are carried
+    /// through verbatim: the key/value form
+    /// (`source=hermes-opt-data,target=/opt/data,type=volume`) and the
+    /// short form (`./cache:/cache`). [`to_container_spec`] parses them
+    /// into [`crate::container::MountSpec`]s; an entry we cannot
+    /// interpret is reported as an error rather than silently dropped.
     #[serde(default)]
     pub mounts: Vec<String>,
     /// Verbatim docker-style flags from devcontainer.json `runArgs`.
@@ -132,15 +153,190 @@ pub struct ParsedDevContainer {
     pub post_attach_command: Option<LifecycleCommand>,
 }
 
+/// Error raised while translating a parsed `devcontainer.json` into a
+/// runtime-agnostic [`ContainerSpec`].
+///
+/// These are *config* problems rather than runtime problems: every
+/// backend would fail the same way, so they are surfaced before any
+/// runtime is asked to do work.
+#[derive(Debug, thiserror::Error)]
+pub enum TranslateError {
+    /// A `mounts` entry could not be interpreted. The original entry is
+    /// carried verbatim so the user sees exactly what was refused.
+    #[error("unsupported `mounts` entry {raw:?}: {reason}")]
+    Mount { raw: String, reason: String },
+}
+
+/// Parse one `devcontainer.json` `mounts` entry into a [`MountSpec`].
+///
+/// Two syntaxes are accepted, matching what the upstream implementations
+/// hand to the container engine:
+///
+/// * key/value — `source=hermes-opt-data,target=/opt/data,type=volume`
+///   (the `docker run --mount` form, and what the engine bundle emits
+///   for the object syntax)
+/// * short — `./cache:/cache:ro` (the `docker run -v` form)
+///
+/// `readonly` / `ro` is honoured in both. Unknown key/value fields are
+/// rejected rather than ignored: silently discarding a `consistency` or
+/// `bind-propagation` request would produce a container that starts but
+/// is not the one the user asked for.
+pub fn parse_mount(raw: &str) -> Result<MountSpec, String> {
+    let entry = raw.trim();
+    if entry.is_empty() {
+        return Err("entry is empty".to_string());
+    }
+    if entry.contains('=') {
+        parse_kv_mount(entry)
+    } else {
+        parse_short_mount(entry)
+    }
+}
+
+fn parse_kv_mount(entry: &str) -> Result<MountSpec, String> {
+    let mut kind = None;
+    let mut source: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut read_only = false;
+
+    for field in entry.split(',') {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = field.split_once('=') else {
+            return Err(format!("field {field:?} is not a `key=value` pair"));
+        };
+        let value = value.trim();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "type" => {
+                kind = Some(match value.to_ascii_lowercase().as_str() {
+                    "bind" => MountKind::Bind,
+                    "volume" => MountKind::Volume,
+                    other => {
+                        return Err(format!(
+                            "unsupported mount `type={other}` (expected `bind` or `volume`)"
+                        ))
+                    }
+                });
+            }
+            "source" | "src" => source = Some(value.to_string()),
+            "target" | "destination" | "dst" => target = Some(value.to_string()),
+            "readonly" | "read-only" => {
+                read_only = !matches!(value.to_ascii_lowercase().as_str(), "false" | "0" | "");
+            }
+            other => return Err(format!("unsupported mount field {other:?}")),
+        }
+    }
+
+    let kind = kind.ok_or_else(|| "missing `type` (expected `bind` or `volume`)".to_string())?;
+    finish_mount(kind, source, target, read_only)
+}
+
+fn parse_short_mount(entry: &str) -> Result<MountSpec, String> {
+    let parts = split_short_mount(entry);
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err("expected `source:target` or `source:target:options`".to_string());
+    }
+    let source = parts[0].trim().to_string();
+    if source.is_empty() {
+        return Err("missing `source`".to_string());
+    }
+    // The short form does not state bind vs volume; like the Docker and
+    // Podman CLIs we infer it — a path is a bind mount, anything else is
+    // a named volume. A Windows drive-letter source (`C:\src`) counts as
+    // a path even though it does not start with `/`, `.` or `~`.
+    let drive_letter = source.len() > 2
+        && source.as_bytes()[1] == b':'
+        && source
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic());
+    let path_like = source.starts_with('/')
+        || source.starts_with('.')
+        || source.starts_with('~')
+        || drive_letter;
+    let kind = if path_like {
+        MountKind::Bind
+    } else {
+        MountKind::Volume
+    };
+    let read_only = parts
+        .get(2)
+        .map(|opts| opts.split(',').any(|o| o.trim().eq_ignore_ascii_case("ro")))
+        .unwrap_or(false);
+    finish_mount(
+        kind,
+        Some(source),
+        Some(parts[1].trim().to_string()),
+        read_only,
+    )
+}
+
+/// Shared tail of both mount parsers: apply defaults and reject the
+/// combinations we cannot represent faithfully.
+fn finish_mount(
+    kind: MountKind,
+    source: Option<String>,
+    target: Option<String>,
+    read_only: bool,
+) -> Result<MountSpec, String> {
+    let Some(target) = target.filter(|t| !t.is_empty()) else {
+        return Err("missing `target`".to_string());
+    };
+    let Some(source) = source.filter(|s| !s.is_empty()) else {
+        // Anonymous volumes (`type=volume,target=/data` with no source)
+        // are valid Docker but have no representation in
+        // `MountSpec::source`. Reject explicitly rather than inventing a
+        // name the user did not ask for.
+        return Err("missing `source` (anonymous volumes are not supported)".to_string());
+    };
+    Ok(MountSpec {
+        kind,
+        source: PathBuf::from(source),
+        target: PathBuf::from(target),
+        read_only,
+    })
+}
+
+/// Split the short `-v` form on `:` while leaving a leading Windows
+/// drive letter (`C:\src`) intact.
+fn split_short_mount(entry: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = entry.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' {
+            // A single leading ASCII letter followed by a path separator
+            // is a drive letter, not a field separator.
+            let drive_letter = current.len() == 1
+                && current.chars().all(|d| d.is_ascii_alphabetic())
+                && chars.peek().is_some_and(|n| *n == '\\' || *n == '/');
+            if !drive_letter {
+                parts.push(std::mem::take(&mut current));
+                continue;
+            }
+        }
+        current.push(c);
+    }
+    parts.push(current);
+    parts
+}
+
 /// Translate the parsed config into a runtime-agnostic [`ContainerSpec`],
 /// given the already-resolved [`ImageRef`] (the lifecycle decides whether
 /// it came from `pull` or `build`).
+///
+/// Returns [`TranslateError`] when the config asks for something we
+/// cannot faithfully express — currently only an unparseable `mounts`
+/// entry. Callers are expected to abort the launch rather than create a
+/// container that quietly differs from the requested configuration.
 pub fn to_container_spec(
     parsed: &ParsedDevContainer,
     image_ref: ImageRef,
     workspace_id: &str,
     host_workspace: &std::path::Path,
-) -> ContainerSpec {
+) -> Result<ContainerSpec, TranslateError> {
     let workspace_target = parsed.workspace_folder.clone().unwrap_or_else(|| {
         PathBuf::from("/workspaces").join(
             host_workspace
@@ -150,12 +346,21 @@ pub fn to_container_spec(
         )
     });
 
-    let mounts = vec![crate::container::MountSpec {
-        kind: crate::container::MountKind::Bind,
+    // The workspace bind mount is always first so the orchestrator's
+    // `host_mounts` bookkeeping can rely on its position; project mounts
+    // follow in declaration order.
+    let mut mounts = vec![MountSpec {
+        kind: MountKind::Bind,
         source: host_workspace.to_path_buf(),
         target: workspace_target.clone(),
         read_only: false,
     }];
+    for raw in &parsed.mounts {
+        mounts.push(parse_mount(raw).map_err(|reason| TranslateError::Mount {
+            raw: raw.clone(),
+            reason,
+        })?);
+    }
 
     let ports = parsed
         .forward_ports
@@ -183,21 +388,32 @@ pub fn to_container_spec(
     let name =
         sanitize_entity_name(&raw_name).unwrap_or_else(|| format!("devcontainer-{workspace_id}"));
 
-    ContainerSpec {
+    // Devcontainers spec defaults `overrideCommand` to true, and the
+    // sleep loop below is what that default means: it replaces the
+    // image's CMD/ENTRYPOINT with a long-running no-op so the container
+    // stays alive for `exec`-driven workflows. Without it, base images
+    // whose CMD exits immediately (e.g. `bash` without a TTY) leave us
+    // with a "stopped" container the moment `start` returns and `exec`
+    // then fails with "no sandbox client exists: container is stopped".
+    //
+    // When the project opts out with `overrideCommand: false` we must
+    // substitute nothing at all: `None` leaves the image's own
+    // ENTRYPOINT/CMD in charge, which long-running service images
+    // (s6-supervised agents, `CMD ["gateway", "run"]`, …) depend on.
+    let command = if parsed.override_command == Some(false) {
+        None
+    } else {
+        Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "while sleep 2147483647; do :; done".to_string(),
+        ])
+    };
+
+    Ok(ContainerSpec {
         name,
         image: image_ref,
-        // Devcontainers spec defaults `overrideCommand` to true: replace
-        // the image's CMD/ENTRYPOINT with a long-running no-op so the
-        // container stays alive for `exec`-driven workflows. Without
-        // this, base images whose CMD exits immediately (e.g. `bash`
-        // without a TTY) leave us with a "stopped" container the moment
-        // `start` returns and `exec` then fails with "no sandbox
-        // client exists: container is stopped".
-        command: Some(vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "while sleep 2147483647; do :; done".into(),
-        ]),
+        command,
         workdir: Some(workspace_target),
         env,
         mounts,
@@ -206,7 +422,7 @@ pub fn to_container_spec(
         privileged: false,
         run_args: parsed.run_args.clone(),
         labels: std::collections::HashMap::new(),
-    }
+    })
 }
 
 /// Derive a deterministic, repo-unique container name from the host
@@ -358,13 +574,15 @@ mod tests {
             parse_image_ref("ubuntu:24.04"),
             "ws-1",
             std::path::Path::new("/tmp/take-two"),
-        );
+        )
+        .expect("translate");
         let spec_b = to_container_spec(
             &parsed,
             parse_image_ref("ubuntu:24.04"),
             "ws-2",
             std::path::Path::new("/tmp/new-from-temp"),
-        );
+        )
+        .expect("translate");
         // Two different repos with the same devcontainer name must
         // produce distinct container names.
         assert_ne!(spec_a.name, spec_b.name);
@@ -380,7 +598,8 @@ mod tests {
             parse_image_ref("ubuntu:24.04"),
             "ws-1",
             std::path::Path::new("/tmp/take-two"),
-        );
+        )
+        .expect("translate");
         assert_eq!(spec_a.name, again.name);
     }
 
@@ -396,7 +615,8 @@ mod tests {
             parse_image_ref("ubuntu:24.04"),
             "ws-1",
             std::path::Path::new("/tmp/repo"),
-        );
+        )
+        .expect("translate");
         assert_eq!(spec.run_args, vec!["--cpus=4", "--memory=8g"]);
     }
 
@@ -407,5 +627,172 @@ mod tests {
         assert_eq!(r.repository, "example/app");
         assert_eq!(r.tag.as_deref(), Some("1.0"));
         assert_eq!(r.digest.as_deref(), Some("sha256:deadbeef"));
+    }
+
+    // -----------------------------------------------------------------
+    // Hermes acceptance fixture.
+    //
+    // `wiki3-ai/hermes-devcontainer` is the real-world configuration the
+    // common layer has to get right: a custom Dockerfile over a
+    // long-running service image, `overrideCommand:false` so the image's
+    // `CMD ["gateway", "run"]` survives, a named volume for durable
+    // state, host aliases via `runArgs`, and forwarded ports. These are
+    // generic Dev Container behaviours — nothing here is special-cased
+    // for Hermes.
+    // -----------------------------------------------------------------
+
+    fn hermes_parsed() -> ParsedDevContainer {
+        ParsedDevContainer {
+            name: Some("Hermes Agent + Unsloth".into()),
+            build: Some(DevContainerBuild {
+                dockerfile: Some("Dockerfile".into()),
+                context: Some(".".into()),
+                ..Default::default()
+            }),
+            override_command: Some(false),
+            mounts: vec!["source=hermes-opt-data,target=/opt/data,type=volume".into()],
+            run_args: vec![
+                "--add-host=host.docker.internal:host-gateway".into(),
+                "--add-host=host.containers.internal:host-gateway".into(),
+            ],
+            forward_ports: vec![8642, 9119],
+            container_env: [
+                ("HERMES_DASHBOARD".to_string(), "1".to_string()),
+                ("HERMES_DASHBOARD_HOST".to_string(), "0.0.0.0".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            post_create_command: Some(LifecycleCommand::Single(
+                ".devcontainer/configure-hermes.sh".into(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hermes_config_survives_translation() {
+        let parsed = hermes_parsed();
+        let spec = to_container_spec(
+            &parsed,
+            parse_image_ref("hermes-devcontainer:test"),
+            "ws-hermes",
+            std::path::Path::new("/tmp/hermes-devcontainer"),
+        )
+        .expect("translate");
+
+        // `overrideCommand:false` => the image keeps its own CMD. This is
+        // what keeps `gateway run` alive; injecting the keepalive sleep
+        // loop here would start the container with the wrong process.
+        assert_eq!(
+            spec.command, None,
+            "`overrideCommand:false` must not substitute a command"
+        );
+
+        // Workspace bind mount first, then the project's named volume.
+        assert_eq!(spec.mounts.len(), 2);
+        assert_eq!(spec.mounts[0].kind, MountKind::Bind);
+        assert_eq!(spec.mounts[1].kind, MountKind::Volume);
+        assert_eq!(spec.mounts[1].source, PathBuf::from("hermes-opt-data"));
+        assert_eq!(spec.mounts[1].target, PathBuf::from("/opt/data"));
+        assert!(!spec.mounts[1].read_only);
+
+        // runArgs reach the runtime untouched: whether they are
+        // *supported* is the runtime's call, not the translator's.
+        assert_eq!(spec.run_args.len(), 2);
+        assert!(spec.run_args[0].starts_with("--add-host=host.docker.internal"));
+
+        assert_eq!(
+            spec.env.get("HERMES_DASHBOARD").map(String::as_str),
+            Some("1")
+        );
+        let ports: Vec<u16> = spec.ports.iter().map(|p| p.container_port).collect();
+        assert_eq!(ports, vec![8642, 9119]);
+    }
+
+    #[test]
+    fn override_command_absent_or_true_installs_keepalive() {
+        for override_command in [None, Some(true)] {
+            let parsed = ParsedDevContainer {
+                image: Some("ubuntu:24.04".into()),
+                override_command,
+                ..Default::default()
+            };
+            let spec = to_container_spec(
+                &parsed,
+                parse_image_ref("ubuntu:24.04"),
+                "ws",
+                std::path::Path::new("/tmp/repo"),
+            )
+            .expect("translate");
+            let cmd = spec
+                .command
+                .unwrap_or_else(|| panic!("expected keepalive for {override_command:?}"));
+            assert_eq!(cmd[0], "/bin/sh");
+            assert!(
+                cmd[2].contains("sleep"),
+                "expected sleep loop for {override_command:?}, got {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_mount_reads_the_docker_mount_form() {
+        let m = parse_mount("source=hermes-opt-data,target=/opt/data,type=volume").expect("parse");
+        assert_eq!(m.kind, MountKind::Volume);
+        assert_eq!(m.source, PathBuf::from("hermes-opt-data"));
+        assert_eq!(m.target, PathBuf::from("/opt/data"));
+        assert!(!m.read_only);
+    }
+
+    #[test]
+    fn parse_mount_reads_the_short_form_and_infers_kind() {
+        let bind = parse_mount("/host/cache:/cache:ro").expect("parse");
+        assert_eq!(bind.kind, MountKind::Bind);
+        assert!(bind.read_only);
+
+        let vol = parse_mount("cache-vol:/cache").expect("parse");
+        assert_eq!(vol.kind, MountKind::Volume);
+        assert!(!vol.read_only);
+    }
+
+    #[test]
+    fn parse_mount_keeps_windows_drive_letters_intact() {
+        let m = parse_mount(r"C:\Users\me\src:/src").expect("parse");
+        // The drive-letter colon must not be treated as a separator, and
+        // a drive path is a bind mount even though it lacks a leading `/`.
+        assert_eq!(m.kind, MountKind::Bind);
+        assert_eq!(m.source, PathBuf::from(r"C:\Users\me\src"));
+        assert_eq!(m.target, PathBuf::from("/src"));
+    }
+
+    #[test]
+    fn parse_mount_rejects_what_it_cannot_express() {
+        // Unknown fields are refused rather than dropped — silently
+        // ignoring `consistency` would start a container that is not the
+        // one the user asked for.
+        assert!(parse_mount("source=a,target=/b,type=bind,consistency=cached").is_err());
+        assert!(parse_mount("source=a,target=/b,type=tmpfs").is_err());
+        // Anonymous volumes have no representation in `MountSpec::source`.
+        assert!(parse_mount("target=/data,type=volume").is_err());
+        assert!(parse_mount("").is_err());
+    }
+
+    #[test]
+    fn unparseable_mount_fails_translation_instead_of_being_dropped() {
+        let parsed = ParsedDevContainer {
+            image: Some("ubuntu:24.04".into()),
+            mounts: vec!["source=a,target=/b,type=tmpfs".into()],
+            ..Default::default()
+        };
+        let err = to_container_spec(
+            &parsed,
+            parse_image_ref("ubuntu:24.04"),
+            "ws",
+            std::path::Path::new("/tmp/repo"),
+        )
+        .err()
+        .expect("an unsupported mount type must not be silently dropped");
+        let msg = err.to_string();
+        assert!(msg.contains("tmpfs"), "error should quote the entry: {msg}");
     }
 }

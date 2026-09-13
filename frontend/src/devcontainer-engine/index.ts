@@ -88,6 +88,15 @@ export interface ParsedDevContainer {
 	configFilePath?: string;
 	workspaceFolder?: string;
 	workspaceMount?: string;
+	/**
+	 * devcontainer.json `overrideCommand`. Per the spec this defaults to
+	 * `true`, meaning the host replaces the image's ENTRYPOINT/CMD with a
+	 * keep-alive command so the container stays up for `exec`-driven
+	 * workflows. `false` means the image's own CMD must be left alone —
+	 * required by images such as `CMD ["gateway", "run"]` that are the
+	 * point of the container. Omitted means "unspecified" (= true).
+	 */
+	overrideCommand?: boolean;
 	mounts: string[];
 	forwardPorts: number[];
 	/**
@@ -175,6 +184,7 @@ export function toParsed(config: DevContainerConfig, configFilePath?: string): P
 			target?: string;
 		};
 		dockerComposeFile?: unknown;
+		overrideCommand?: boolean;
 		mounts?: (Mount | string)[];
 		forwardPorts?: (number | string)[];
 		runArgs?: string[];
@@ -216,6 +226,7 @@ export function toParsed(config: DevContainerConfig, configFilePath?: string): P
 		configFilePath,
 		workspaceFolder: c.workspaceFolder,
 		workspaceMount: c.workspaceMount,
+		overrideCommand: c.overrideCommand,
 		mounts,
 		forwardPorts,
 		runArgs,

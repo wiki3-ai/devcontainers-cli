@@ -61,6 +61,41 @@ fn validate_supported(parsed: &ParsedDevContainer) -> Result<(), LifecycleError>
     Ok(())
 }
 
+/// Ask the selected backend whether it can faithfully run `parsed`.
+///
+/// Deliberately runs before image resolution: a configuration we are
+/// going to refuse must not be pulled or built first, or the user waits
+/// out a multi-minute build only to be told the runtime cannot do it.
+///
+/// The reason is pushed to the log sink as well as returned, so a UI
+/// that only shows the log stream still explains the refusal.
+fn validate_compatible(
+    sink: &dyn EventSink,
+    runtime: &dyn ContainerRuntime,
+    workspace_id: &str,
+    parsed: &ParsedDevContainer,
+) -> Result<(), LifecycleError> {
+    let report = runtime.validate_devcontainer(parsed);
+    if report.is_supported() {
+        return Ok(());
+    }
+    let summary = report.summary();
+    warn!(
+        workspace = workspace_id,
+        runtime = ?runtime.id(),
+        "incompatible devcontainer configuration: {summary}"
+    );
+    sink.log(
+        workspace_id,
+        LogStreamKind::System,
+        &format!("incompatible configuration: {summary}"),
+    );
+    Err(LifecycleError::Unsupported(format!(
+        "{:?} cannot run this devcontainer.json: {summary}",
+        runtime.id()
+    )))
+}
+
 /// Coerce an arbitrary slug into a valid OCI image tag fragment:
 /// lowercase, `[a-z0-9._-]` only, max 128 chars. Empty/all-bad input
 /// collapses to `workspace` so we always produce a runnable tag.
@@ -925,6 +960,10 @@ impl LifecycleOrchestrator {
         let parsed = self.parsed(workspace_id)?;
         let runtime = registry.selected();
         validate_supported(&parsed)?;
+        // Ask the selected backend whether it can faithfully run this
+        // configuration — before pulling an image or running a Dockerfile
+        // build, so an unsupported config is refused cheaply.
+        validate_compatible(sink, runtime.as_ref(), workspace_id, &parsed)?;
         ensure_runtime_ready(sink, runtime.as_ref(), workspace_id).await?;
 
         // Compute the config-hash up front so we can both gate
@@ -960,7 +999,8 @@ impl LifecycleOrchestrator {
                 &proxy_env,
             )
             .await?;
-        let mut spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace);
+        let mut spec = to_container_spec(&parsed, image_ref.clone(), workspace_id, host_workspace)
+            .map_err(|e| LifecycleError::Unsupported(e.to_string()))?;
         // Forward proxy env vars into the container so that lifecycle
         // hooks (e.g. `postCreateCommand: pip install ...`) can reach
         // the network. We inject *both* `HTTP_PROXY` and `http_proxy`
@@ -1935,6 +1975,10 @@ mod tests {
         /// Lines emitted on the build log channel before the build
         /// returns. Each is sent as `(stream, line)`.
         build_log: Vec<(LogStreamKind, String)>,
+        /// When set, [`FakeRuntime::validate_devcontainer`] returns this
+        /// instead of the "supported" default, so the orchestrator's
+        /// preflight gate can be exercised without a real backend.
+        compat: Option<crate::container::CompatibilityReport>,
     }
 
     struct FakeRuntime {
@@ -1964,6 +2008,16 @@ mod tests {
                 version: Some("fake".into()),
                 reason: None,
             })
+        }
+        fn validate_devcontainer(
+            &self,
+            _parsed: &ParsedDevContainer,
+        ) -> crate::container::CompatibilityReport {
+            self.script
+                .lock()
+                .compat
+                .take()
+                .unwrap_or_else(crate::container::CompatibilityReport::supported)
         }
         async fn pull(&self, _image: &ImageRef) -> Result<(), ContainerRuntimeError> {
             if let Some(e) = self.script.lock().pull_err.take() {
@@ -2337,6 +2391,73 @@ mod tests {
         assert!(
             msg.contains("dockerComposeFile") && msg.contains("one-container-per-repo"),
             "expected compose-rejection error, got: {msg}"
+        );
+    }
+
+    // -------- preflight compatibility is refused before anything is built --------
+
+    /// A backend that cannot run the configuration must stop `up` at the
+    /// very start. This pins the ordering that matters: for a
+    /// Dockerfile-based config nothing is pulled or built first, so the
+    /// user is not made to wait out a build that was never going to be
+    /// usable.
+    #[tokio::test]
+    async fn up_refuses_incompatible_config_before_build() {
+        let o = LifecycleOrchestrator::new();
+        let parsed = ParsedDevContainer {
+            build: Some(DevContainerBuild {
+                dockerfile: Some("Dockerfile".into()),
+                ..Default::default()
+            }),
+            run_args: vec!["--add-host=host.docker.internal:host-gateway".into()],
+            config_file_path: Some(PathBuf::from("/tmp/ws/.devcontainer/devcontainer.json")),
+            ..Default::default()
+        };
+        o.set_parsed_config("ws", parsed);
+
+        let mut script = FakeScript::default();
+        let mut report = crate::container::CompatibilityReport::supported();
+        report.push(crate::container::CompatibilityIssue::unsupported(
+            "runArgs",
+            Some("--add-host=host.docker.internal:host-gateway".into()),
+            "this backend cannot add /etc/hosts entries",
+        ));
+        script.compat = Some(report);
+
+        let registry = registry_with(FakeRuntime::new(script));
+        let sink = Arc::new(CapturingSink::default());
+
+        let err = o
+            .up_with_sink(sink.clone(), &registry, "ws", &PathBuf::from("/tmp/ws"))
+            .await
+            .expect_err("an incompatible config must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot run this devcontainer.json"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("--add-host"), "got: {msg}");
+
+        // The refusal must be visible to a log-only UI, not just in the
+        // returned error.
+        assert!(
+            sink.logs
+                .lock()
+                .iter()
+                .any(|l| l.line.contains("incompatible configuration")),
+            "the reason must be logged"
+        );
+
+        // And nothing may have been built or created.
+        let states: Vec<String> = sink
+            .statuses
+            .lock()
+            .iter()
+            .map(|s| s.state.clone())
+            .collect();
+        assert!(
+            !states.iter().any(|s| s == "building" || s == "creating"),
+            "no build/create should be attempted; states: {states:?}"
         );
     }
 

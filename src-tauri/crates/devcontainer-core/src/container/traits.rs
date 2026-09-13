@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::devcontainer::translate::ParsedDevContainer;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeId {
@@ -46,7 +48,7 @@ pub struct MountSpec {
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MountKind {
     Bind,
@@ -226,6 +228,26 @@ pub trait ContainerRuntime: Send + Sync {
     /// optionally a `reason`.
     async fn probe(&self) -> Result<RuntimeAvailability, ContainerRuntimeError>;
 
+    /// Preflight check: can this backend faithfully run this
+    /// configuration?
+    ///
+    /// The orchestrator calls this at the very start of `up`, before it
+    /// pulls an image or runs a Dockerfile build, so a backend can
+    /// refuse a configuration it cannot express instead of letting its
+    /// CLI fail late — or, worse, quietly ignoring a setting and
+    /// starting a container that differs from the request.
+    ///
+    /// The input is the *parsed* config rather than a [`ContainerSpec`]
+    /// precisely so the check can run before image resolution: a
+    /// configuration we are going to refuse must not be built first.
+    ///
+    /// The default assumes full support. Backends with known gaps
+    /// override it and enumerate what they cannot do.
+    fn validate_devcontainer(&self, parsed: &ParsedDevContainer) -> CompatibilityReport {
+        let _ = parsed;
+        CompatibilityReport::supported()
+    }
+
     /// Ensure any out-of-process daemon/services this backend depends on
     /// are running, starting them if necessary. Idempotent. The default
     /// is a no-op for backends that have no separate service component.
@@ -304,4 +326,108 @@ pub struct RuntimeAvailability {
     pub available: bool,
     pub version: Option<String>,
     pub reason: Option<String>,
+}
+
+/// How badly a runtime's inability to honour part of a configuration
+/// affects correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompatibilitySeverity {
+    /// The backend cannot express this field at all. Starting the
+    /// container anyway would silently produce something other than
+    /// what the configuration asked for, so it is a hard failure.
+    Unsupported,
+    /// The backend can do roughly this, but not with the exact
+    /// semantics requested. Worth warning about; not worth refusing.
+    Degraded,
+}
+
+impl CompatibilitySeverity {
+    /// Whether an issue at this severity must block a launch.
+    pub fn is_blocking(self) -> bool {
+        matches!(self, CompatibilitySeverity::Unsupported)
+    }
+}
+
+/// One reason a backend cannot faithfully run a configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatibilityIssue {
+    pub severity: CompatibilitySeverity,
+    /// The devcontainer.json field this is about, e.g. `runArgs`.
+    pub field: String,
+    /// The offending value, verbatim, when the issue is about one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Human-readable explanation, including what the user can do instead.
+    pub message: String,
+}
+
+impl CompatibilityIssue {
+    /// An issue that must block the launch.
+    pub fn unsupported(
+        field: impl Into<String>,
+        value: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: CompatibilitySeverity::Unsupported,
+            field: field.into(),
+            value,
+            message: message.into(),
+        }
+    }
+}
+
+/// The outcome of asking a backend [`ContainerRuntime::validate_spec`]
+/// whether it can run a given [`ContainerSpec`].
+///
+/// This is the mechanism behind the rule that a runtime must never
+/// silently drop a Dev Container setting: anything it cannot honour has
+/// to show up here, and blocking issues stop the launch before the
+/// container is created.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompatibilityReport {
+    pub issues: Vec<CompatibilityIssue>,
+}
+
+impl CompatibilityReport {
+    /// A report for a backend that can run the spec as-is.
+    pub fn supported() -> Self {
+        Self::default()
+    }
+
+    /// Whether the spec can be run — i.e. no blocking issues.
+    pub fn is_supported(&self) -> bool {
+        !self.issues.iter().any(|i| i.severity.is_blocking())
+    }
+
+    /// Issues that must block the launch.
+    pub fn blocking(&self) -> impl Iterator<Item = &CompatibilityIssue> {
+        self.issues.iter().filter(|i| i.severity.is_blocking())
+    }
+
+    pub fn push(&mut self, issue: CompatibilityIssue) {
+        self.issues.push(issue);
+    }
+
+    /// One-line explanation suitable for an error message or log line.
+    pub fn summary(&self) -> String {
+        if self.issues.is_empty() {
+            return "compatible".to_string();
+        }
+        self.issues
+            .iter()
+            .map(|i| {
+                let prefix = match i.severity {
+                    CompatibilitySeverity::Unsupported => "unsupported",
+                    CompatibilitySeverity::Degraded => "degraded",
+                };
+                match &i.value {
+                    Some(v) => format!("{prefix} {} {v:?}: {}", i.field, i.message),
+                    None => format!("{prefix} {}: {}", i.field, i.message),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
