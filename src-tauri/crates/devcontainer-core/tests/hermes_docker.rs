@@ -395,3 +395,146 @@ async fn hermes_data_volume_survives_recreation() {
         println!("removed container {cid2}");
     }
 }
+
+/// The `Remove` button's contract: the container must be **gone**, not merely
+/// stopped. Reported from the field as "it seems to Stop but I don't think the
+/// container is removed", so this pins the difference between the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Docker and the hermes-devcontainer checkout"]
+async fn remove_actually_removes_the_container() {
+    let _guard = serialise().await;
+    let Some(repo) = hermes_repo() else {
+        eprintln!("SKIP: hermes-devcontainer not found");
+        return;
+    };
+    if !assert_prerequisites(&repo) {
+        return;
+    }
+
+    let workspace_id = "hermes-remove";
+    let orchestrator = LifecycleOrchestrator::new();
+    orchestrator.set_parsed_config(workspace_id, load_parsed(&repo));
+    orchestrator.record_host_workspace(workspace_id, &repo);
+    let registry = RuntimeRegistry::with_single(RuntimeId::Docker, Arc::new(DockerRuntime::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(PrintSink);
+
+    let up = orchestrator
+        .up_with_sink(sink.clone(), &registry, workspace_id, &repo)
+        .await
+        .expect("up");
+    let cid = up.container_id.clone().expect("container id");
+    println!("up -> {cid}");
+
+    let (ok, status) = docker(&["inspect", "--format", "{{.State.Status}}", &cid]);
+    assert!(
+        ok && status == "running",
+        "precondition: running, got {ok} {status}"
+    );
+
+    // Wait until Hermes is genuinely up before removing. The field report came
+    // from a container that had been running for minutes with its dashboard
+    // serving, and tearing down a fully-initialised s6-supervised container
+    // can behave differently from one killed a moment after creation — which
+    // is exactly what the first version of this test did.
+    assert!(
+        http_responds(9119, Duration::from_secs(90)),
+        "precondition: the dashboard should be answering before we remove"
+    );
+    println!("dashboard is up and serving; now removing the running container");
+
+    let after = orchestrator
+        .remove_with_sink(sink.as_ref(), &registry, workspace_id)
+        .await
+        .expect("remove");
+    println!(
+        "after remove: state={} container_id={:?}",
+        after.state, after.container_id
+    );
+
+    // The container must no longer exist at all. `docker inspect` failing is
+    // the proof — a stopped container would still inspect successfully.
+    let (exists, out) = docker(&["inspect", "--format", "{{.State.Status}}", &cid]);
+    println!("docker inspect {cid} -> exists={exists} output={out}");
+    assert!(
+        !exists,
+        "Remove must delete the container, not stop it (inspect still reports {out})"
+    );
+
+    // And the reported state must be `absent`, so the dashboard stops offering
+    // container controls.
+    assert_eq!(after.state, "absent", "state after Remove");
+    assert!(
+        after.container_id.is_none(),
+        "the removed container's id must not be retained"
+    );
+
+    println!("PASS. Remove deleted {cid} outright.");
+}
+
+/// `Remove` after the app has restarted.
+///
+/// `tauri dev` restarts the Rust process on every rebuild, and the
+/// orchestrator's slots are in-memory — so the recorded container id is gone
+/// while the container is still running. Remove then has to fall back to the
+/// deterministic derived name. This pins that fallback, since a silent no-op
+/// there would look exactly like "it stopped but wasn't removed".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Docker and the hermes-devcontainer checkout"]
+async fn remove_works_after_an_app_restart() {
+    let _guard = serialise().await;
+    let Some(repo) = hermes_repo() else {
+        eprintln!("SKIP: hermes-devcontainer not found");
+        return;
+    };
+    if !assert_prerequisites(&repo) {
+        return;
+    }
+
+    let workspace_id = "hermes-restart";
+    let parsed = load_parsed(&repo);
+
+    // Session 1: bring the container up, recording its id in memory.
+    let first = LifecycleOrchestrator::new();
+    first.set_parsed_config(workspace_id, parsed.clone());
+    first.record_host_workspace(workspace_id, &repo);
+    let registry = RuntimeRegistry::with_single(RuntimeId::Docker, Arc::new(DockerRuntime::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(PrintSink);
+    let up = first
+        .up_with_sink(sink.clone(), &registry, workspace_id, &repo)
+        .await
+        .expect("up");
+    let cid = up.container_id.clone().expect("container id");
+    println!("session 1 up -> {cid}");
+
+    // Session 2: a brand-new orchestrator, i.e. a restarted app. No slots.
+    let second = LifecycleOrchestrator::new();
+    second.set_parsed_config(workspace_id, parsed);
+    // The dashboard's 4s poll is what re-learns the host workspace.
+    let polled = second
+        .status_with_drift(&registry, workspace_id, &repo)
+        .await;
+    println!(
+        "after restart, status -> state={} container_id={:?}",
+        polled.state, polled.container_id
+    );
+
+    let after = second
+        .remove_with_sink(sink.as_ref(), &registry, workspace_id)
+        .await
+        .expect("remove");
+    println!(
+        "after remove -> state={} container_id={:?}",
+        after.state, after.container_id
+    );
+
+    let (exists, out) = docker(&["inspect", "--format", "{{.State.Status}}", &cid]);
+    println!("docker inspect {cid} -> exists={exists} output={out}");
+    assert!(
+        !exists,
+        "Remove must delete the container even when the app has restarted \
+         (container {cid} still reports {out})"
+    );
+    assert_eq!(after.state, "absent");
+
+    println!("PASS. Remove after restart deleted {cid}.");
+}
