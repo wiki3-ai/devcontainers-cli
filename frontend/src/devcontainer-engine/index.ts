@@ -100,6 +100,14 @@ export interface ParsedDevContainer {
 	mounts: string[];
 	forwardPorts: number[];
 	/**
+	 * `devcontainer.json` `portsAttributes`, keyed by port number as a string.
+	 *
+	 * Carried through verbatim rather than modelled: embedding apps use
+	 * `label` and `protocol` to caption their port panels, and a key we do not
+	 * know about yet should not be dropped on the way through.
+	 */
+	portsAttributes?: Record<string, unknown>;
+	/**
 	 * Verbatim docker-style flags from `devcontainer.json` `runArgs`.
 	 * Forwarded to the runtime's `create` invocation as-is so users
 	 * can request resource limits (e.g. `--cpus=4`, `--memory=8g`).
@@ -187,6 +195,7 @@ export function toParsed(config: DevContainerConfig, configFilePath?: string): P
 		overrideCommand?: boolean;
 		mounts?: (Mount | string)[];
 		forwardPorts?: (number | string)[];
+		portsAttributes?: Record<string, unknown>;
 		runArgs?: string[];
 		workspaceFolder?: string;
 		workspaceMount?: string;
@@ -229,6 +238,7 @@ export function toParsed(config: DevContainerConfig, configFilePath?: string): P
 		overrideCommand: c.overrideCommand,
 		mounts,
 		forwardPorts,
+		portsAttributes: c.portsAttributes,
 		runArgs,
 		remoteUser: c.remoteUser,
 		containerEnv: c.containerEnv ?? {},
