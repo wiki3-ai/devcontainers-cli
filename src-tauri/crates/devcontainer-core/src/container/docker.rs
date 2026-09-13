@@ -10,6 +10,15 @@
 //! `--mount` / `--publish` / `--env` forms the translation layer emits are
 //! Docker's own native syntax, and `runArgs` are passed straight through —
 //! so unlike the Apple backend this one has no deny-list.
+//!
+//! # Shared with the Podman backend
+//!
+//! Podman's CLI is deliberately Docker-compatible for every operation the
+//! orchestrator performs, so [`super::podman::PodmanRuntime`] drives this
+//! implementation rather than duplicating it, overriding only the binary it
+//! probes and how it answers "is the engine up?". The argv builders and
+//! inspect parsing here are therefore the *shared* Docker-compatible surface,
+//! not Docker-private helpers — a bug fixed here is fixed for both engines.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -351,6 +360,10 @@ pub(crate) fn map_state(status: Option<&str>) -> ContainerState {
         "created" => ContainerState::Created,
         "running" => ContainerState::Running,
         "exited" | "dead" => ContainerState::Exited,
+        // Podman reports a stopped container as `stopped` where Docker says
+        // `exited`; same meaning, so both map to a real state rather than
+        // falling through to `Unknown`.
+        "stopped" => ContainerState::Stopped,
         _ => ContainerState::Unknown,
     }
 }
@@ -415,6 +428,12 @@ impl DockerRuntime {
     /// [`ContainerRuntime::ensure_system_running`] for that distinction.
     pub fn detect() -> exec_probe::ExecutableProbe {
         exec_probe::probe_binary_in_env("docker", DOCKER_STANDARD_PATHS)
+    }
+
+    /// The resolved CLI, so the Podman backend can run its own version and
+    /// engine-up probes through the same plumbing without duplicating it.
+    pub(crate) fn cli(&self) -> &DockerCli {
+        &self.cli
     }
 
     async fn run<I, S>(&self, args: I) -> Result<String, ContainerRuntimeError>
@@ -743,7 +762,10 @@ impl ContainerRuntime for DockerRuntime {
 /// A non-zero exit becomes an error carrying the CLI's stderr, because
 /// that is where Docker puts the explanation ("No such container", the
 /// failed `RUN` line, the registry auth failure, …).
-async fn run_capturing<I, S>(cli: &DockerCli, args: I) -> Result<String, ContainerRuntimeError>
+pub(crate) async fn run_capturing<I, S>(
+    cli: &DockerCli,
+    args: I,
+) -> Result<String, ContainerRuntimeError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -801,6 +823,13 @@ where
 
 /// Like [`spawn_line_pump`] but also accumulates the bytes, so the same
 /// read serves both live streaming and the eventual [`ExecResult`].
+///
+/// Note the accumulation is *line*-oriented: each line is appended with a
+/// single `\n`, so `ExecResult::stdout` is not byte-identical to the child's
+/// output when its last line had no trailing newline (it gains one). That is
+/// immaterial for what this is used for — lifecycle hooks and short probes
+/// where the exit code and the text matter, not the trailing byte — and it is
+/// why callers should `trim()` before comparing exact strings.
 fn spawn_stream_pump<R>(
     reader: R,
     kind: LogStreamKind,

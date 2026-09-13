@@ -13,6 +13,7 @@ pub mod traits;
 
 pub use docker::DockerRuntime;
 pub use exec_probe::{probe_binary, ExecutableProbe};
+pub use podman::PodmanRuntime;
 pub use traits::{
     BuildSpec, CompatibilityIssue, CompatibilityReport, CompatibilitySeverity, ContainerRuntime,
     ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus, ExecOptions, ExecResult,

@@ -23,8 +23,8 @@ pub use container::{
     probe_binary, BuildSpec, CompatibilityIssue, CompatibilityReport, CompatibilitySeverity,
     ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus,
     DockerRuntime, ExecOptions, ExecResult, ExecutableProbe, ImageRef, LogChunk, LogOptions,
-    LogStream, LogStreamKind, MountKind, MountSpec, PortForward, PortProtocol, RuntimeAvailability,
-    RuntimeId, RuntimeRegistry, DEFAULT_PREFERENCE,
+    LogStream, LogStreamKind, MountKind, MountSpec, PodmanRuntime, PortForward, PortProtocol,
+    RuntimeAvailability, RuntimeId, RuntimeRegistry, DEFAULT_PREFERENCE,
 };
 pub use devcontainer::lifecycle::{
     LifecycleError, LifecycleOrchestrator, LifecycleStatus, LABEL_CONFIG_HASH,
