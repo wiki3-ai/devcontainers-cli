@@ -514,3 +514,44 @@ fn validate_devcontainer_accepts_flags_apple_does_support() {
     assert!(report.is_supported(), "report: {}", report.summary());
     assert!(report.issues.is_empty());
 }
+
+#[test]
+fn validate_devcontainer_blocks_each_verified_unsupported_flag() {
+    let rt = AppleContainersRuntime::with_binary("container");
+    // Each of these was confirmed rejected by `container` 1.4.1 — see
+    // UNSUPPORTED_RUN_ARGS for the exact probe.
+    for flag in [
+        "--privileged",
+        "--hostname=dev",
+        "--expose=8080",
+        "--gpus=all",
+    ] {
+        let report = rt.validate_devcontainer(&parsed_with_run_args(vec![flag.into()]));
+        assert!(
+            !report.is_supported(),
+            "{flag} is rejected by the CLI and must block the launch"
+        );
+    }
+}
+
+#[test]
+fn validate_devcontainer_does_not_reject_flags_apple_actually_supports() {
+    // These all exist on `container` 1.4.1 even though it is easy to
+    // assume otherwise. Asserting they pass keeps the deny-list from
+    // drifting back into guesses.
+    let rt = AppleContainersRuntime::with_binary("container");
+    for flag in [
+        "--tmpfs=/tmp",
+        "--cap-add=NET_RAW",
+        "--shm-size=64M",
+        "--platform=linux/arm64",
+        "--init",
+    ] {
+        let report = rt.validate_devcontainer(&parsed_with_run_args(vec![flag.into()]));
+        assert!(
+            report.is_supported(),
+            "{flag} is supported by the CLI and must not be rejected; report: {}",
+            report.summary()
+        );
+    }
+}

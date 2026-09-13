@@ -44,17 +44,54 @@ pub use cli_helpers::{
 /// the guidance shown to the user when one is requested.
 ///
 /// Deliberately evidence-based: an entry belongs here only once the CLI
-/// has been observed to reject it (or it is confirmed to have no Apple
-/// equivalent). A speculative entry would block a configuration that
-/// actually works, which is worse than letting the CLI report its own
-/// error — so this list should grow from observed failures, not guesses.
-const UNSUPPORTED_RUN_ARGS: &[(&str, &str)] = &[(
-    "--add-host",
-    "Apple Containers cannot add /etc/hosts entries. The host bridge gateway is \
-     already exported as HOST_GATEWAY_IP and written into the container's \
-     /etc/hosts, so reach host services through that instead of \
-     host.docker.internal.",
-)];
+/// has been observed to reject it. A speculative entry would block a
+/// configuration that actually works, which is worse than letting the CLI
+/// report its own error — so this list grows from observed failures, not
+/// guesses.
+///
+/// Every entry was confirmed against `container` CLI 1.4.1 with
+///
+/// ```text
+/// container create --<flag> localhost/wiki3-probe-nonexistent:1
+/// ```
+///
+/// The image argument matters: without it the CLI reports "Missing
+/// expected argument '<image>'" *before* validating options, so every
+/// flag looks accepted. With a bogus `localhost/` image nothing is
+/// pulled and unsupported flags fail fast with `Unknown option`.
+///
+/// Note that `--network`, `--tmpfs`, `--cap-add`, `--shm-size`,
+/// `--platform` and `--init` are **not** listed: they exist on this CLI
+/// despite being easy to assume otherwise.
+const UNSUPPORTED_RUN_ARGS: &[(&str, &str)] = &[
+    (
+        "--add-host",
+        "Apple Containers cannot add /etc/hosts entries. The host bridge gateway is \
+         already exported as HOST_GATEWAY_IP and written into the container's \
+         /etc/hosts, so reach host services through that instead of \
+         host.docker.internal.",
+    ),
+    (
+        "--privileged",
+        "Apple Containers has no --privileged flag. It does support granting \
+         specific capabilities (--cap-add / --cap-drop), which is usually what the \
+         configuration actually needs.",
+    ),
+    (
+        "--hostname",
+        "Apple Containers cannot set the container hostname.",
+    ),
+    (
+        "--expose",
+        "Apple Containers does not implement --expose. Use --publish (-p) to \
+         publish the port instead.",
+    ),
+    (
+        "--gpus",
+        "Apple Containers has no GPU passthrough (there is no --gpus and no \
+         NVIDIA-style device passthrough).",
+    ),
+];
 
 /// Apple Containers backend. The binary name (`container` by default) is
 /// configurable via [`AppleContainersRuntime::with_binary`] so the live
