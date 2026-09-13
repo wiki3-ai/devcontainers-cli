@@ -598,7 +598,7 @@ impl LifecycleOrchestrator {
             .get(workspace_id)
             .and_then(|s| s.parsed.clone());
 
-        let runtime = registry.selected();
+        let runtime = registry.resolve().await;
         // Make sure host_workspace is on the slot before we try to
         // derive a container name from it. This also means subsequent
         // Stop/Rebuild calls — which read host_workspace off the slot
@@ -958,7 +958,7 @@ impl LifecycleOrchestrator {
         let sink_arc = sink;
         let sink: &dyn EventSink = sink_arc.as_ref();
         let parsed = self.parsed(workspace_id)?;
-        let runtime = registry.selected();
+        let runtime = registry.resolve().await;
         validate_supported(&parsed)?;
         // Ask the selected backend whether it can faithfully run this
         // configuration — before pulling an image or running a Dockerfile
@@ -1235,7 +1235,7 @@ impl LifecycleOrchestrator {
         let lock = self.lock_for(workspace_id);
         let _guard = lock.lock().await;
 
-        let runtime = registry.selected();
+        let runtime = registry.resolve().await;
         // Prefer the recorded id, but fall back to the derived
         // container name when the slot is empty (typical after an app
         // restart: the user's container is still running but we
@@ -1300,7 +1300,7 @@ impl LifecycleOrchestrator {
         let lock = self.lock_for(workspace_id);
         let _guard = lock.lock().await;
 
-        let runtime = registry.selected();
+        let runtime = registry.resolve().await;
         // Prefer the recorded id, but if we don't have one (e.g. the app
         // was restarted, or `up` failed before recording it) fall back to
         // the container name we *would have* used. This is what the

@@ -20,16 +20,19 @@ pub mod devcontainer;
 pub mod events;
 
 pub use container::{
-    BuildSpec, ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState,
-    ContainerStatus, ExecOptions, ExecResult, ImageRef, LogChunk, LogOptions, LogStream,
-    LogStreamKind, MountKind, MountSpec, PortForward, PortProtocol, RuntimeAvailability, RuntimeId,
-    RuntimeRegistry,
+    probe_binary, BuildSpec, CompatibilityIssue, CompatibilityReport, CompatibilitySeverity,
+    ContainerRuntime, ContainerRuntimeError, ContainerSpec, ContainerState, ContainerStatus,
+    DockerRuntime, ExecOptions, ExecResult, ExecutableProbe, ImageRef, LogChunk, LogOptions,
+    LogStream, LogStreamKind, MountKind, MountSpec, PortForward, PortProtocol, RuntimeAvailability,
+    RuntimeId, RuntimeRegistry, DEFAULT_PREFERENCE,
 };
 pub use devcontainer::lifecycle::{
     LifecycleError, LifecycleOrchestrator, LifecycleStatus, LABEL_CONFIG_HASH,
 };
 pub use devcontainer::proxy_manager::ProxyManager;
-pub use devcontainer::translate::{DevContainerBuild, LifecycleCommand, ParsedDevContainer};
+pub use devcontainer::translate::{
+    parse_mount, DevContainerBuild, LifecycleCommand, ParsedDevContainer, TranslateError,
+};
 pub use events::EventSink;
 
 // Re-exported so app crates can return proxy stats from Tauri
