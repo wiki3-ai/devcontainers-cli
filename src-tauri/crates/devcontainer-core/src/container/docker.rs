@@ -45,11 +45,61 @@ use super::traits::{
 /// and manual installs land in the usual `bin` directories. The bundle
 /// path matters because a Finder-launched app inherits launchd's minimal
 /// `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which contains none of these.
+///
+/// The Windows equivalents are computed — see
+/// [`windows_docker_install_paths`] — because they live under environment
+/// variables rather than fixed roots.
 const DOCKER_STANDARD_PATHS: &[&str] = &[
     "/Applications/Docker.app/Contents/Resources/bin/docker",
     "/usr/local/bin/docker",
     "/opt/homebrew/bin/docker",
 ];
+
+/// Docker Desktop's install locations on Windows, most preferred first.
+///
+/// Docker Desktop puts the CLI it wants users to run in
+/// `%ProgramFiles%\Docker\Docker\resources\bin`. The WSL-side copy under
+/// `%LOCALAPPDATA%` is listed as a fallback for installs that did not lay
+/// down the resources directory.
+#[cfg(windows)]
+fn windows_docker_install_paths() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut out = Vec::new();
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        out.push(
+            PathBuf::from(pf)
+                .join("Docker")
+                .join("Docker")
+                .join("resources")
+                .join("bin")
+                .join("docker.exe"),
+        );
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        out.push(
+            PathBuf::from(local)
+                .join("Docker")
+                .join("wsl")
+                .join("docker.exe"),
+        );
+    }
+    out
+}
+
+/// No Windows-specific locations on other platforms.
+#[cfg(not(windows))]
+fn windows_docker_install_paths() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+/// Every location to probe, most preferred first.
+fn docker_standard_paths() -> Vec<std::path::PathBuf> {
+    DOCKER_STANDARD_PATHS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(windows_docker_install_paths())
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct DockerCli {
@@ -408,7 +458,7 @@ impl DockerRuntime {
     /// `PATH`, falling back to the bare name so error messages still make
     /// sense when nothing was found.
     pub fn new() -> Self {
-        let binary = exec_probe::probe_binary_in_env("docker", DOCKER_STANDARD_PATHS)
+        let binary = exec_probe::probe_binary_in_env("docker", &docker_standard_paths())
             .path_str()
             .map(str::to_owned)
             .unwrap_or_else(|| "docker".to_string());
@@ -427,7 +477,7 @@ impl DockerRuntime {
     /// deliberately does not require the daemon to be up — see
     /// [`ContainerRuntime::ensure_system_running`] for that distinction.
     pub fn detect() -> exec_probe::ExecutableProbe {
-        exec_probe::probe_binary_in_env("docker", DOCKER_STANDARD_PATHS)
+        exec_probe::probe_binary_in_env("docker", &docker_standard_paths())
     }
 
     /// The resolved CLI, so the Podman backend can run its own version and

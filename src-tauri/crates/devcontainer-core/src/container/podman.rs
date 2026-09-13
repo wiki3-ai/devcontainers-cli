@@ -40,6 +40,52 @@ const PODMAN_STANDARD_PATHS: &[&str] = &[
     "/opt/homebrew/bin/podman",
 ];
 
+/// Podman's install locations on Windows, most preferred first.
+///
+/// The installer writes to `%ProgramFiles%\RedHat\Podman`, with the CLI in
+/// `bin`; a per-user `podman machine` install can land under
+/// `%LOCALAPPDATA%\Programs`.
+#[cfg(windows)]
+fn windows_podman_install_paths() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut out = Vec::new();
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        out.push(
+            PathBuf::from(pf)
+                .join("RedHat")
+                .join("Podman")
+                .join("bin")
+                .join("podman.exe"),
+        );
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        out.push(
+            PathBuf::from(local)
+                .join("Programs")
+                .join("RedHat")
+                .join("Podman")
+                .join("bin")
+                .join("podman.exe"),
+        );
+    }
+    out
+}
+
+/// No Windows-specific locations on other platforms.
+#[cfg(not(windows))]
+fn windows_podman_install_paths() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+/// Every location to probe, most preferred first.
+fn podman_standard_paths() -> Vec<std::path::PathBuf> {
+    PODMAN_STANDARD_PATHS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(windows_podman_install_paths())
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct PodmanRuntime {
     inner: DockerRuntime,
@@ -56,7 +102,7 @@ impl PodmanRuntime {
     /// `PATH`, falling back to the bare name so error messages still make
     /// sense when nothing was found.
     pub fn new() -> Self {
-        let binary = exec_probe::probe_binary_in_env("podman", PODMAN_STANDARD_PATHS)
+        let binary = exec_probe::probe_binary_in_env("podman", &podman_standard_paths())
             .path_str()
             .map(str::to_owned)
             .unwrap_or_else(|| "podman".to_string());
@@ -75,7 +121,7 @@ impl PodmanRuntime {
     /// deliberately does not require the machine VM to be running — see
     /// [`ContainerRuntime::ensure_system_running`] for that distinction.
     pub fn detect() -> exec_probe::ExecutableProbe {
-        exec_probe::probe_binary_in_env("podman", PODMAN_STANDARD_PATHS)
+        exec_probe::probe_binary_in_env("podman", &podman_standard_paths())
     }
 }
 

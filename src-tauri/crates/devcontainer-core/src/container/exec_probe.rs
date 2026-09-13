@@ -11,6 +11,9 @@
 //! So: probe a list of known install locations first, then fall back to
 //! walking `PATH` for any remaining case (Linux, a custom prefix, a
 //! version-manager shim).
+//!
+//! On Windows the executable carries an `.exe` extension, so the `PATH`
+//! walk tries both spellings — see [`executable_names`].
 
 use std::path::{Path, PathBuf};
 
@@ -50,14 +53,15 @@ pub fn probe_binary(
         }
     }
     if let Some(path_env) = path_env {
-        for dir in split_path_env(path_env) {
-            let candidate = dir.join(binary_name);
-            if is_runnable(&candidate) {
-                return ExecutableProbe {
-                    installed: true,
-                    path: Some(candidate),
-                };
-            }
+        if let Some(found) = find_in_path_dirs(
+            binary_name,
+            &split_path_env(path_env),
+            std::env::consts::EXE_SUFFIX,
+        ) {
+            return ExecutableProbe {
+                installed: true,
+                path: Some(found),
+            };
         }
     }
     ExecutableProbe {
@@ -68,9 +72,8 @@ pub fn probe_binary(
 
 /// Convenience wrapper: probe `binary_name` over `standard_paths` and the
 /// process's current `PATH`.
-pub fn probe_binary_in_env(binary_name: &str, standard_paths: &[&str]) -> ExecutableProbe {
-    let paths: Vec<PathBuf> = standard_paths.iter().map(PathBuf::from).collect();
-    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+pub fn probe_binary_in_env(binary_name: &str, standard_paths: &[PathBuf]) -> ExecutableProbe {
+    let refs: Vec<&Path> = standard_paths.iter().map(PathBuf::as_path).collect();
     let path_env = std::env::var("PATH").ok();
     probe_binary(binary_name, &refs, path_env.as_deref())
 }
@@ -96,6 +99,36 @@ fn is_runnable(path: &Path) -> bool {
     {
         true
     }
+}
+
+/// Look for `binary_name` across `dirs`, trying the executable suffix too.
+///
+/// Split out from [`probe_binary`] with the suffix as a parameter so the
+/// Windows semantics can be tested anywhere, not only on Windows.
+fn find_in_path_dirs(binary_name: &str, dirs: &[PathBuf], suffix: &str) -> Option<PathBuf> {
+    for dir in dirs {
+        for name in executable_names(binary_name, suffix) {
+            let candidate = dir.join(&name);
+            if is_runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// File names to try for `binary_name`, in order.
+///
+/// On Windows the CLI is `docker.exe`, so `dir.join("docker")` would never
+/// match and the runtime would look uninstalled. The bare name stays first so
+/// an extensionless shim still wins on platforms that have one, and a name
+/// that already carries the suffix is not doubled up.
+fn executable_names(binary_name: &str, suffix: &str) -> Vec<String> {
+    let mut names = vec![binary_name.to_string()];
+    if !suffix.is_empty() && !binary_name.ends_with(suffix) {
+        names.push(format!("{binary_name}{suffix}"));
+    }
+    names
 }
 
 /// Split a `PATH` value into non-empty entries.
@@ -202,5 +235,62 @@ mod tests {
         assert!(!probe.installed);
         assert!(probe.path.is_none());
         assert!(probe.path_str().is_none());
+    }
+
+    /// Write a fake executable named `name` into `dir` and mark it runnable.
+    fn fake_binary(dir: &Path, name: &str) -> PathBuf {
+        let bin = dir.join(name);
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    #[test]
+    fn finds_an_exe_suffixed_binary_when_there_is_no_bare_one() {
+        // Windows ships `docker.exe`, so joining the bare name would miss it
+        // and the runtime would report itself uninstalled. Exercised here with
+        // an explicit suffix so it runs on any platform.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(dir.path(), "docker.exe");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        assert_eq!(find_in_path_dirs("docker", &dirs, ".exe"), Some(bin));
+        // The pre-fix behaviour: with no suffix there is nothing to find.
+        assert_eq!(find_in_path_dirs("docker", &dirs, ""), None);
+    }
+
+    #[test]
+    fn prefers_the_bare_name_over_the_suffixed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = fake_binary(dir.path(), "docker");
+        let _suffixed = fake_binary(dir.path(), "docker.exe");
+        let dirs = vec![dir.path().to_path_buf()];
+        assert_eq!(find_in_path_dirs("docker", &dirs, ".exe"), Some(bare));
+    }
+
+    #[test]
+    fn does_not_double_a_suffix_the_name_already_has() {
+        assert_eq!(executable_names("docker.exe", ".exe"), vec!["docker.exe"]);
+        assert_eq!(
+            executable_names("docker", ".exe"),
+            vec!["docker", "docker.exe"]
+        );
+        // Off Windows the suffix is empty, so only the bare name is tried.
+        assert_eq!(executable_names("docker", ""), vec!["docker"]);
+    }
+
+    #[test]
+    fn the_path_walk_searches_every_directory() {
+        // A CLI installed into a later `PATH` entry must still be found — the
+        // first directory simply not having it is not a failure.
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let bin = fake_binary(second.path(), "docker.exe");
+        let dirs = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        assert_eq!(find_in_path_dirs("docker", &dirs, ".exe"), Some(bin));
     }
 }
