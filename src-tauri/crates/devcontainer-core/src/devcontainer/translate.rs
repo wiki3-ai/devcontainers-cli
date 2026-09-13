@@ -122,13 +122,19 @@ pub struct ParsedDevContainer {
     pub run_args: Vec<String>,
     /// Ports to forward from the container to the host. The
     /// devcontainer spec allows entries to be either bare integers
-    /// (`8000`) or strings (`"8000"`, `"host:8000"`); the
-    /// [`config`](crate::devcontainer::config) parser normalises both
-    /// forms into u16 container ports.
-    ///
-    /// [`config`]: super::config
+    /// (`8000`) or strings (`"8000"`, `"host:8000"`); the engine's
+    /// `toParsed` normalises both forms into u16 container ports.
     #[serde(default)]
     pub forward_ports: Vec<u16>,
+    /// `devcontainer.json` `portsAttributes`, keyed by port number as a
+    /// string — e.g. `{"9119": {"label": "Dashboard", "protocol": "http"}}`.
+    ///
+    /// Carried through verbatim, like `customizations`: the spec fixes a
+    /// small set of keys, but consumers read at most `label` and `protocol`,
+    /// and passing the object through means a key we do not model yet is not
+    /// silently dropped.
+    #[serde(default)]
+    pub ports_attributes: Option<serde_json::Value>,
     #[serde(default)]
     pub remote_user: Option<String>,
     #[serde(default)]
@@ -640,6 +646,41 @@ mod tests {
     // generic Dev Container behaviours — nothing here is special-cased
     // for Hermes.
     // -----------------------------------------------------------------
+
+    #[test]
+    fn ports_attributes_round_trip_as_camel_case() {
+        // The field travels WebView → Rust as JSON, so the wire name has to be
+        // `portsAttributes`. Getting that wrong is silent: the value arrives as
+        // `None` and the port panel just loses its labels.
+        let parsed = ParsedDevContainer {
+            forward_ports: vec![9119],
+            ports_attributes: Some(serde_json::json!({
+                "9119": { "label": "Dashboard", "protocol": "http" }
+            })),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            json.get("portsAttributes").is_some(),
+            "wrong wire name in {json}"
+        );
+        assert_eq!(json["portsAttributes"]["9119"]["label"], "Dashboard");
+
+        let back: ParsedDevContainer = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.ports_attributes.as_ref().unwrap()["9119"]["protocol"],
+            "http"
+        );
+    }
+
+    #[test]
+    fn ports_attributes_default_to_none_when_absent() {
+        // A config that carries no `portsAttributes` must stay loadable.
+        let parsed: ParsedDevContainer =
+            serde_json::from_value(serde_json::json!({ "image": "alpine" })).unwrap();
+        assert!(parsed.ports_attributes.is_none());
+    }
 
     fn hermes_parsed() -> ParsedDevContainer {
         ParsedDevContainer {

@@ -700,11 +700,25 @@ impl LifecycleOrchestrator {
             .clone()
     }
 
-    fn parsed(&self, workspace_id: &str) -> Result<ParsedDevContainer, LifecycleError> {
+    /// The config most recently submitted for `workspace_id`, if any.
+    ///
+    /// Exposed so a caller can read a property of the config — port
+    /// attributes, say — without re-parsing `devcontainer.json`. The frontend
+    /// engine owns parsing; a second parser would be a second source of truth,
+    /// free to disagree with the config the container was actually created
+    /// from.
+    ///
+    /// `None` means nothing has been submitted yet, which is the normal state
+    /// between app startup and the dashboard's first submit.
+    pub fn parsed_config(&self, workspace_id: &str) -> Option<ParsedDevContainer> {
         self.slots
             .read()
             .get(workspace_id)
             .and_then(|s| s.parsed.clone())
+    }
+
+    fn parsed(&self, workspace_id: &str) -> Result<ParsedDevContainer, LifecycleError> {
+        self.parsed_config(workspace_id)
             .ok_or_else(|| LifecycleError::NoConfig(workspace_id.to_string()))
     }
 
@@ -1966,6 +1980,32 @@ mod tests {
         o.set_parsed_config("ws-1", p);
         assert!(o.parsed("ws-1").is_ok());
         assert!(matches!(o.parsed("ws-2"), Err(LifecycleError::NoConfig(_))));
+    }
+
+    #[test]
+    fn parsed_config_exposes_the_submitted_config_or_none() {
+        // `parsed_config` is the read side of `set_parsed_config`, and the
+        // caller (the dashboard's port panel) has to distinguish "no config
+        // submitted yet" from "config with no forwarded ports".
+        let o = LifecycleOrchestrator::new();
+        assert!(o.parsed_config("ws-1").is_none());
+
+        o.set_parsed_config(
+            "ws-1",
+            ParsedDevContainer {
+                image: Some("ubuntu".into()),
+                forward_ports: vec![9119],
+                ports_attributes: Some(serde_json::json!({
+                    "9119": { "label": "Dashboard" }
+                })),
+                ..Default::default()
+            },
+        );
+
+        let cfg = o.parsed_config("ws-1").expect("config was submitted");
+        assert_eq!(cfg.forward_ports, vec![9119]);
+        assert_eq!(cfg.ports_attributes.unwrap()["9119"]["label"], "Dashboard");
+        assert!(o.parsed_config("ws-2").is_none());
     }
 
     #[test]
