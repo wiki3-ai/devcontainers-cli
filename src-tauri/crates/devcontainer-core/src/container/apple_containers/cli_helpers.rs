@@ -552,11 +552,11 @@ pub async fn stop_container_by_name(container_bin: &Path, name: &str) -> Result<
 }
 
 fn split_path_env(path_env: &str) -> Vec<PathBuf> {
-    path_env
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
+    // `std::env::split_paths`, not `str::split(':')`: on Windows the separator
+    // is `;` and every path contains a colon in its drive letter, so splitting
+    // on `:` shreds `C:\a;C:\b` into `["C", "\a;C", "\b"]` and no binary is
+    // ever found. This mirrors `exec_probe::split_path_env`.
+    std::env::split_paths(path_env).collect()
 }
 
 fn is_runnable(p: &Path) -> bool {
