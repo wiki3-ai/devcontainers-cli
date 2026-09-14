@@ -2580,12 +2580,14 @@ mod tests {
         let o = LifecycleOrchestrator::new();
         o.set_parsed_config("ws", parsed_with_image("ubuntu:24.04"));
 
-        let mut script = FakeScript::default();
-        script.start_err = Some(
-            "failed to set up container networking: Bind for 0.0.0.0:8642 failed: \
-             port is already allocated"
-                .into(),
-        );
+        let script = FakeScript {
+            start_err: Some(
+                "failed to set up container networking: Bind for 0.0.0.0:8642 failed: \
+                 port is already allocated"
+                    .into(),
+            ),
+            ..Default::default()
+        };
         let registry = registry_with(FakeRuntime::new(script));
         let sink = Arc::new(CapturingSink::default());
 

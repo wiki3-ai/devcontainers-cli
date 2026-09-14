@@ -831,8 +831,7 @@ mod tests {
             "ws",
             std::path::Path::new("/tmp/repo"),
         )
-        .err()
-        .expect("an unsupported mount type must not be silently dropped");
+        .expect_err("an unsupported mount type must not be silently dropped");
         let msg = err.to_string();
         assert!(msg.contains("tmpfs"), "error should quote the entry: {msg}");
     }

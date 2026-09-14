@@ -2,9 +2,12 @@ name: devcontainers-app
 
 on:
   push:
-    branches: [main]
+    # `docker-runtime` is the active development branch for the fork's Rust
+    # crate. With only `main` listed, every commit on it went untested and
+    # accumulated clippy findings that nobody saw.
+    branches: [main, docker-runtime]
   pull_request:
-    branches: [main]
+    branches: [main, docker-runtime]
 
 jobs:
   rust:
@@ -34,6 +37,33 @@ jobs:
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # The crate is the part that has to work on Windows: it decides whether
+  # `docker.exe` / `podman.exe` exist and drives them. Nothing here was ever
+  # run on Windows until this job, which is the only way to know — a
+  # cross-compiled `cargo check` on a Mac proves it compiles, not that it runs.
+  #
+  # Scoped to the crate rather than the workspace: the Tauri host app is a
+  # separate question and needs its own WebView2/system-dep story.
+  rust-windows:
+    name: cargo test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cargo fmt --check
+      - run: cargo check -p devcontainer-core --all-targets
+      - run: cargo clippy -p devcontainer-core --all-targets -- -D warnings
+      - run: cargo test -p devcontainer-core
 
   deno:
     name: deno check / build
