@@ -629,12 +629,20 @@ mod tests {
         #[cfg(unix)]
         make_executable(&exe);
 
-        let path_env = format!("/nowhere:{}", bin_dir.display());
+        // Join with the platform's separator. Hardcoding `:` makes this a
+        // single bogus entry on Windows, where the separator is `;`, so the
+        // probe correctly finds nothing and the test fails for the wrong
+        // reason.
+        let path_env =
+            std::env::join_paths([std::path::PathBuf::from("/nowhere"), bin_dir.clone()])
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+
         let status = probe_with_dirs(&[], Some(&path_env));
         assert!(status.installed);
         assert_eq!(status.path.as_deref(), Some(exe.as_path()));
     }
-
     #[cfg(unix)]
     #[test]
     fn non_executable_file_is_not_accepted() {
